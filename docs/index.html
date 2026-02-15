@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Foveated Screen Perception</title>
+  <style>
+    body {
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 0 20px;
+      font-family: Georgia, 'Times New Roman', serif;
+      line-height: 1.6;
+      color: #333;
+    }
+    h1 { font-size: 1.8em; margin-bottom: 0.2em; }
+    .subtitle { color: #666; font-size: 1.1em; margin-bottom: 1.5em; }
+    .authors { margin-bottom: 1.5em; }
+    .authors a { color: #333; }
+    .links { margin: 1.5em 0; }
+    .links a {
+      display: inline-block;
+      padding: 8px 20px;
+      margin-right: 10px;
+      margin-bottom: 8px;
+      background: #2d2d2d;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 4px;
+      font-size: 0.95em;
+    }
+    .links a:hover { background: #555; }
+    .abstract { background: #f8f8f8; padding: 20px; border-left: 3px solid #ccc; margin: 1.5em 0; }
+    .abstract h2 { font-size: 1.1em; margin-top: 0; }
+    .modes-table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: 0.9em; }
+    .modes-table th, .modes-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }
+    .modes-table th { background: #f0f0f0; }
+    code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+
+<h1>Foveated Screen Perception</h1>
+<div class="subtitle">Bio-Inspired Top-Down Observation Control for Computer-Use Agents</div>
+
+<div class="authors">
+  <strong>Eric Liang</strong><br>
+  April 2026
+</div>
+
+<div class="links">
+  <a href="https://github.com/ericxl/foveated-screen-perception/blob/main/paper/main.pdf">PDF</a>
+  <a href="https://github.com/ericxl/foveated-screen-perception">Code</a>
+</div>
+
+<div class="abstract">
+  <h2>Abstract</h2>
+  <p>
+    Computer-use agents built on vision-language models send a full screenshot to the model at every step,
+    consuming approximately 1,300 tokens per observation. A 50-step desktop task spends roughly 65,000 tokens
+    on screenshots alone, yet recent evidence shows this visual history does not improve task performance:
+    only text-based action history helps.
+  </p>
+  <p>
+    We introduce <strong>Foveated Screen Perception</strong> (FSP), a bio-inspired observation interface
+    that replaces the fixed screenshot-per-step loop with an <code>observe</code> tool offering four modes:
+  </p>
+  <table class="modes-table">
+    <tr><th>Mode</th><th>Returns</th><th>Bio Analog</th><th>Cost</th></tr>
+    <tr><td><code>check</code></td><td>Text only</td><td>Predictive coding</td><td>~10-50 tok</td></tr>
+    <tr><td><code>read</code></td><td>Text only</td><td>Foveal text reading</td><td>~20-100 tok</td></tr>
+    <tr><td><code>glance</code></td><td>Text only</td><td>Gist extraction</td><td>~30-50 tok</td></tr>
+    <tr><td><code>look</code></td><td>Image crop</td><td>Foveal fixation</td><td>~50-150 tok</td></tr>
+  </table>
+  <p>
+    Three of the four modes return text only; the single image mode is a fallback for when spatial or visual
+    detail cannot be captured as text. The LLM selects its observation mode at each step based on current task
+    goals, a direct analog of top-down attentional control in the primate visual system.
+  </p>
+  <p>
+    We evaluate FSP in a 2x2 factorial design crossing two frontier models (GPT-5.4 and Claude Opus 4.6)
+    with two perception conditions on ScreenSpot-Pro and OSWorld. FSP is designed to yield an estimated
+    19-33x reduction in observation tokens per task.
+  </p>
+</div>
+
+<h2>Key Idea</h2>
+<p>
+  Current agents see the screen like a security camera: full frame, every frame. Humans see it like a human:
+  glance to orient, read the text you need, check if your action worked, and only <em>look</em> closely
+  when something visual demands it. FSP gives the LLM the same choice.
+</p>
+
+<h2>Evaluation Design</h2>
+<table class="modes-table">
+  <tr><th></th><th>Standard CU (full screenshot)</th><th>FSP (observe tool)</th></tr>
+  <tr><td><strong>GPT-5.4</strong></td><td>Baseline A</td><td>Treatment A</td></tr>
+  <tr><td><strong>Opus 4.6</strong></td><td>Baseline B</td><td>Treatment B</td></tr>
+</table>
+<p>Conclusive if FSP wins on both rows (model-agnostic improvement).</p>
+
+</body>
+</html>
