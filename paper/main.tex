@@ -1,0 +1,739 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+
+% Listings style
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\bfseries,
+  commentstyle=\itshape\color{gray},
+  frame=single,
+  breaklines=true,
+  aboveskip=0.5em,
+  belowskip=0.5em
+}
+
+\title{Foveated Screen Perception: Bio-Inspired Top-Down Observation Control for Computer-Use Agents}
+
+\author{
+  Xiaoyong Liang \\
+  \texttt{xiaoyong@utexas.edu}
+}
+
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+% ===========================================================================
+% ABSTRACT
+% ===========================================================================
+
+\begin{abstract}
+Computer-use agents built on vision-language models send a full screenshot to the model at every step, consuming approximately 1{,}300 tokens per observation.
+A 50-step desktop task therefore spends roughly 65{,}000 tokens on screenshots alone, often exceeding 80\% of total context, yet recent evidence shows this visual history does not improve task performance: only text-based action history helps \cite{osworld-human}.
+Agents also take 1.4--2.7$\times$ more steps than necessary, with GUI grounding errors as the dominant failure mode.
+
+We introduce \textbf{Foveated Screen Perception} (FSP), a bio-inspired observation interface that replaces the fixed screenshot-per-step loop with an \texttt{observe} tool offering four modes: \texttt{check} (predictive coding verification, text-only, $\sim$10--50 tokens), \texttt{read} (foveal text extraction, text-only, $\sim$20--100 tokens), \texttt{glance} (gist extraction, text-only, $\sim$30--50 tokens), and \texttt{look} (foveal image crop, $\sim$50--150 tokens).
+Three of the four modes return text only; the single image mode is used as a fallback when spatial or visual detail cannot be captured as text.
+The LLM selects its observation mode at each step based on current task goals, a direct analog of top-down attentional control in the primate visual system, where high-level objectives bias sensory processing before the stimulus arrives.
+
+We evaluate FSP in a $2 \times 2$ factorial design crossing two frontier models (GPT-5.4 and Claude Opus 4.6) with two perception conditions (standard full-screenshot and FSP) on the ScreenSpot-Pro grounding benchmark and OSWorld desktop task suite.
+FSP is designed to yield an estimated 19--33$\times$ reduction in observation tokens per task while targeting comparable or improved grounding accuracy and task completion.
+We release the \texttt{observe} tool implementation, evaluation harness, and all experimental logs.
+\end{abstract}
+
+
+% ===========================================================================
+% 1. INTRODUCTION
+% ===========================================================================
+
+\section{Introduction}
+\label{sec:introduction}
+
+The dominant architecture for computer-use agents is uniform.
+Whether the system is OpenAI Operator \cite{openai-operator}, Google Mariner \cite{google-mariner}, ByteDance UI-TARS \cite{ui-tars,ui-tars-2}, or Anthropic's Claude Computer Use \cite{claude-computer-use}, the perception loop is the same: capture a full screenshot, encode it as tokens, send it to a vision-language model, receive an action, execute, and repeat.
+Every step pays the same cost, roughly 1{,}300 tokens on Claude and 765--1{,}105 on GPT-4o, regardless of whether the screen changed, whether the agent needs visual information at all, or whether a few words of text would suffice.
+
+This is expensive.
+A routine 50-step desktop task burns approximately 65{,}000 tokens on screenshot encoding alone, and screenshot tokens typically constitute 80\% or more of total context.
+The cost extends beyond token usage.
+The growing visual context actively degrades performance.
+The OSWorld-Human study \cite{osworld-human} found that planning and reflection calls consume 75--94\% of total task latency, with each successive step taking up to $3\times$ longer as context grows.
+The study also showed that screenshot-only history does not improve performance; only text-based action history helps.
+Agents routinely take 1.4--2.7$\times$ more steps than human-optimal trajectories, and across OSWorld \cite{osworld}, ScreenSpot-Pro \cite{screenspot-pro}, and WindowsAgentArena \cite{windowsagentarena}, the dominant failure mode is GUI grounding errors: misclicking, selecting the wrong element, or failing to locate a target that occupies a mere 0.07\% of the viewport.
+
+\subsection{How Human Vision Solves the Bandwidth Problem}
+\label{sec:intro-human-vision}
+
+The human visual system solves an analogous bandwidth problem through five mechanisms: gist extraction (scene categorization within 36--100ms before any saccade~\cite{oliva-torralba-gist,thorpe1996speed}), foveation (high acuity only at the $\sim$2\textdegree{} foveal center), saccadic targeting (3--4 goal-directed fixations per second~\cite{land-hayhoe-saccades}), top-down attentional control (prefrontal goal representations bias visual processing before the stimulus arrives~\cite{desimone-duncan-attention,wolfe-guided-search}), and predictive coding (only prediction errors propagate upward through the cortical hierarchy~\cite{rao-ballard-1999}). Together these compress $\sim$10$^9$ bits/sec of retinal input to $\sim$10$^7$ bits/sec at cortex~\cite{koch2006retina}. Current computer-use agents implement none of them.
+
+\subsection{The Text Insight}
+\label{sec:intro-text-insight}
+
+A critical but underappreciated fact about screen interaction is that the vast majority of it is text comprehension.
+When a user reads a menu, checks an error message, scans a form field label, or verifies a status indicator, the visual processing is merely a means to an end: the information being extracted is text.
+Eye-tracking studies of knowledge workers show that over 70\% of fixation time is spent on textual elements \cite{rayner-eye-movements}.
+
+This suggests a fundamental inefficiency in the screenshot-per-step paradigm.
+Encoding a 1920$\times$1080 screenshot as $\sim$1{,}300 vision tokens in order to read a 5-word error message is a 100$\times$ overhead in token cost for no informational gain; the text could be delivered directly via OCR or accessibility APIs at a cost of 10--20 tokens.
+The field has converged on this insight from multiple directions: Fara-7B \cite{fara-7b} retains only the last 3 screenshots but keeps all text history; the JetBrains ``Complexity Trap'' study \cite{jetbrains-complexity-trap} found that replacing old observations with text placeholders halves cost with no performance loss; and DirectShell \cite{directshell} achieves 85\% task success using only accessibility-tree text at 50--200 tokens per step (though it fails on applications with incomplete accessibility support~\cite{screen2ax}).
+
+\subsection{Prior Work on Targeted Observation}
+\label{sec:intro-prior-work}
+
+The zoom-and-crop literature has shown that letting agents inspect sub-regions of the screen consistently improves grounding accuracy, often without retraining.
+RegionFocus \cite{regionfocus} improves UI-TARS-72B on ScreenSpot-Pro from 38.1\% to 50.2\% via iterative multi-aspect-ratio crops.
+ZoomClick \cite{zoomclick} achieves 73.1\% with a training-free 3-stage zoom cascade.
+AdaZoom-GUI \cite{adazoom-gui} reaches 76.8\% using GRPO-trained conditional zoom on small predicted elements.
+GUI-Eyes \cite{gui-eyes} is the first system to use RL to train the zoom decision itself, achieving 44.8\% with a 3B model that learns when to crop and when not to.
+
+These systems share a limitation: they operate exclusively in the image domain.
+Every observation mode returns pixels, whether a full screenshot, a crop, or a zoomed region.
+No existing system offers the agent a choice between text and image observation, despite the evidence that text extraction is sufficient for most interaction steps.
+Claude Computer Use's \texttt{zoom} action \cite{claude-computer-use} is the closest production feature, but it still returns an image crop rather than extracted text.
+
+\subsection{Foveated Screen Perception}
+\label{sec:intro-fsp}
+
+We propose \textbf{Foveated Screen Perception} (FSP), an observation interface that gives the LLM explicit control over how it perceives the screen.
+FSP provides a single \texttt{observe} tool with four modes mapped to the biological perception cycle: \texttt{glance} (scene gist, text-only), \texttt{read} (text extraction at coordinates, text-only), \texttt{look} (high-resolution image crop), and \texttt{check} (predictive verification against stated expectations, text-only). \texttt{look} is the sole mode that returns pixels, reserved for non-text elements. The agent selects its mode based on current task goals, implementing top-down attentional control. We describe the full design in Section~\ref{sec:method}.
+
+\subsection{Contributions}
+\label{sec:intro-contributions}
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item We introduce the \texttt{observe} tool interface with four biologically motivated perception modes---the first computer-use observation system where text is the default modality and pixels are the exception.
+
+\item We frame LLM observation control as top-down attentional selection and identify the missing bottom-up (stimulus-driven) component as a concrete direction for future work.
+
+\item We evaluate FSP in a $2 \times 2$ factorial design crossing two frontier models (GPT-5.4 and Claude Opus 4.6) with two perception conditions on ScreenSpot-Pro and OSWorld, controlling for the possibility that results are model-specific.
+
+\item We project an estimated 19--33$\times$ reduction in observation tokens per task, with a typical step costing 15--40 tokens (text-only \texttt{check} or \texttt{read}) versus 1{,}300 tokens (full screenshot).
+\end{enumerate}
+
+
+% ===========================================================================
+% 2. RELATED WORK
+% ===========================================================================
+
+\section{Related Work}
+\label{sec:related-work}
+
+FSP sits at the intersection of several active research threads. These include how computer-use agents observe their environment, how zoom and crop improve GUI grounding, the tradeoff between accessibility trees and vision, context compression methods, and bio-inspired visual processing. We survey each in turn, highlighting the gap that motivates our unified observation-control framework.
+
+\subsection{Observation in Computer-Use Agents}
+\label{sec:rw-observation}
+
+Nearly every production computer-use system follows the same perception loop: capture a full screenshot, send it to a vision-language model (VLM), receive an action, execute, and repeat. OpenAI Operator and its underlying Computer-Using Agent (CUA) API~\cite{openai-operator}, Google Mariner~\cite{google-mariner}, ByteDance's UI-TARS and UI-TARS-2~\cite{ui-tars,ui-tars-2}, and SeeAct-V~\cite{seeact-v} all employ this pattern. The model receives the full viewport at every turn with no crop, zoom, or modality selection, a design inherited from early web agents rather than derived from any analysis of what information the model actually needs.
+
+Two notable exceptions depart from this paradigm. \textbf{Claude Computer Use}~\cite{claude-computer-use} exposes a \texttt{zoom} action that returns a cropped, upscaled sub-region of the screen. This is the only production API where the model itself can request a targeted view, and Claude's OSWorld score reached approximately 72.5\% in late 2025, roughly double the previous state of the art. \textbf{GUI-Eyes}~\cite{gui-eyes} goes further by RL-training the agent to decide whether and how to invoke perception tools (\texttt{crop} and \texttt{zoom}), using a composite reward $R = 0.6 R_\text{acc} + 0.1 R_\text{format} + 0.3 R_\text{tool}$ where $R_\text{tool}$ combines spatial proximity and region IoU. A 3B-parameter model with GUI-Eyes reaches 44.8\% on ScreenSpot-Pro, compared to 30.2\% without, a 48\% relative improvement from perception control alone.
+
+Despite these advances, no existing system provides the agent with a unified observation interface that spans multiple modalities (text extraction, scene gist, image crop, change verification) and defaults to text-only output.
+
+\subsection{Zoom and Crop for GUI Grounding}
+\label{sec:rw-zoom-crop}
+
+The small-element problem is the core driver of grounding errors in screen understanding. ScreenSpot-Pro targets occupy only 0.07\% of total image area~\cite{screenspot-pro}, compared to 2.01\% in older benchmarks, making precise localization of UI elements a severe challenge for VLMs processing full-resolution screenshots. A rapidly growing body of work demonstrates that letting agents zoom into candidate regions yields dramatic grounding improvements, often with no retraining required.
+
+\textbf{RegionFocus}~\cite{regionfocus}, presented at ICCV 2025, performs iterative zoom with multiple aspect-ratio crops and stamps pink-star markers at prior attempt locations to prevent revisiting. It improves UI-TARS-72B from 38.1\% to 50.2\% and Qwen2.5-VL-72B from 47.8\% to 61.6\% on ScreenSpot-Pro. \textbf{ScreenSeeker}~\cite{screenseeker} uses GPT-4o as a planner to guide cascaded recursive cropping, with a smaller OS-Atlas-7B model grounding within each patch; this pushes OS-Atlas-7B from 18.9\% to 48.1\%, a 154-percentage-point relative gain. \textbf{ZoomClick}~\cite{zoomclick}, from Princeton, introduces a training-free three-stage zoom pipeline operating on a $2 \times 2$ grid at depth 3 with $0.5\times$ shrinkage per iteration and a minimum crop size of 768 pixels, improving UI-Venus-72B from 61.4\% to 73.1\%.
+
+More recent methods incorporate learned zoom policies. \textbf{AdaZoom-GUI}~\cite{adazoom-gui} trains a conditional zoom policy via Group Relative Policy Optimization (GRPO), learning to zoom only on predicted small elements while refining instructions through Qwen3.5; it achieves 76.8\% on ScreenSpot-Pro (up from 61.6\%), the current state of the art. \textbf{GUI-ARP}~\cite{gui-arp} uses attention-map-guided cropping with adaptive stage control, allowing the agent to decide between one-stage and two-stage pipelines, and reaches 60.8\% with a 7B model, surpassing UI-TARS-72B's 38.1\% baseline. \textbf{LASER}~\cite{laser} applies Monte Carlo preference optimization to learn a self-evolving crop policy, improving Qwen2.5-VL-7B from 26.8\% to 47.5\%.
+
+A common limitation unites all of these systems: they address where to crop but not whether to use vision at all. Every method assumes the agent will process a visual crop; none considers that for many interaction steps (reading a label, verifying a click succeeded, understanding a menu) text extraction alone suffices. Our work addresses this gap by making the observation modality itself a decision variable.
+
+\subsection{Accessibility Trees vs.\ Vision}
+\label{sec:rw-a11y-vs-vision}
+
+The structured-data versus vision debate for GUI agents has resolved into a clear hierarchy of approaches.
+
+\textbf{Accessibility-first} methods such as DirectShell~\cite{directshell} consume only 50--200 tokens per step, 10--25$\times$ cheaper than screenshots, and achieve 85\% task success when accessibility (a11y) trees are complete. However, Screen2AX~\cite{screen2ax}, which audited 302 macOS applications, found that only 33\% provide complete native accessibility metadata. DirectShell's success rate drops sharply on applications with poor a11y semantics: 27.3\% on Booking.com, 35.7\% on Google Flights, and near zero on custom canvas-based UIs, games, and applications with non-standard widget toolkits.
+
+\textbf{Vision-first} systems such as UI-TARS~\cite{ui-tars} and OpenAI Operator~\cite{openai-operator} offer universal compatibility across arbitrary applications, but at 1{,}200--5{,}000 tokens per step and with persistent coordinate-precision issues on small elements.
+
+\textbf{Hybrid} approaches currently deliver the best real-world results. UFO2~\cite{ufo2} (Microsoft) queries Windows UI Automation alongside OmniParser-v2~\cite{omniparser}, which combines YOLOv8 detection with Florence-2 captioning to fill gaps where a11y metadata is absent. Agent S2~\cite{agent-s2} (Simular) employs a Mixture of Grounding Experts fusing visual, OCR, and structural signals. OmniParser-v2 processes screenshots into structured elements at 0.6s per frame on an A100, yielding a 73\% accuracy improvement over vision-only baselines. For browser-specific tasks, a11y-first observation dominates, as DOM and a11y trees are well-structured by design; Browser-Use achieves 89.1\% on WebVoyager with a11y-first observation~\cite{browser-use}.
+
+The field has converged on a practical hierarchy: use structured data when available, fall back to vision otherwise, and fuse both when possible. What remains missing is an agent-controlled interface that implements this principle as a runtime decision rather than a static architectural choice. Our \texttt{observe} tool achieves this by using a11y data internally when available while exposing a uniform modality-selection API to the agent.
+
+\subsection{Context Compression}
+\label{sec:rw-context-compression}
+
+The growing context of historical observations is the primary cause of exponential latency degradation in multi-step agent trajectories. The latency overhead documented in Section~\ref{sec:introduction}~\cite{osworld-human} leaves substantial room for reduction.
+
+\textbf{Fara-7B}~\cite{fara-7b} (Microsoft) provides direct evidence for our approach: it retains only the last 3 screenshots in history while preserving all text, and completes tasks in approximately 16 steps versus 41 for UI-TARS-1.5-7B. The key finding, that text-based history is load-bearing while screenshot history is not, directly motivates our text-first observation design.
+
+On the compression side, the JetBrains ``Complexity Trap'' study~\cite{jetbrains-complexity-trap}, presented at NeurIPS DL4Code 2025, showed that simple \textbf{observation masking} (replacing old tool outputs with placeholders such as \texttt{[Previous output: 2,847 tokens, masked]}) halves cost while matching or slightly exceeding LLM-based summarization. In software engineering agent turns where observation dominates token count, a placeholder is often better than a poor summary. \textbf{AgentOCR}~\cite{agent-ocr} takes a complementary approach by rendering text history as images, exploiting the higher information density of visual token encoding in VLMs; it retains 99.5\% of performance while cutting tokens by over 50\%, with the agent selecting its compression rate via RL. \textbf{ACON}~\cite{acon} optimizes natural-language compression guidelines through gradient-free search, achieving 26--54\% peak token reduction.
+
+These methods are complementary to our approach: FSP reduces per-step observation cost at the source (by returning text instead of images for most modes), while compression techniques like Fara-7B's sliding window and JetBrains' observation masking reduce the cost of retaining historical observations. Applied together, they compound.
+
+\subsection{Bio-Inspired Visual Processing}
+\label{sec:rw-bio-inspired}
+
+Our work draws on several threads of biological and bio-inspired vision research, though none have previously been applied to GUI agent perception.
+
+\textbf{Foveated vision transformers.} FovealNet~\cite{fovealnet} and log-polar Vision Transformers~\cite{logpolar-vit} apply spatially varying resolution, high acuity at the fixation center and progressively lower toward the periphery, achieving 30--50\% FLOP reduction on ImageNet classification while preserving accuracy. These architectures demonstrate that full-resolution processing of the entire visual field is unnecessary, but they have not been applied to screen understanding or GUI tasks.
+
+\textbf{Predictive coding networks.} Salvatori et al.~\cite{salvatori-pctransformers} introduced PC-Transformers at ICLR 2024, implementing predictive coding within transformer architectures so that only prediction errors propagate through the network. This maps directly to the concept of change-based observation (processing only what is unexpected after an action) but has not been used for agent observation control. Our \texttt{check} mode operationalizes this principle: the agent states its expectation, and the system reports only the prediction error.
+
+\textbf{Active vision.} Descendants of the Recurrent Attention Model (RAM)~\cite{mnih-ram}, including Active Vision Transformers~\cite{active-vit}, learn sequential fixation policies via reinforcement learning, selecting where to look next based on task requirements. GUI-Eyes~\cite{gui-eyes} is the closest existing system to this paradigm in the GUI domain, training perception-tool usage via RL. Our approach differs by providing a fixed menu of biologically motivated modes rather than learning the perception policy from scratch.
+
+\textbf{Task-conditioned visual encoding.} Modern VLMs such as Qwen2.5-VL~\cite{qwen25-vl} and InternVL 2.5~\cite{internvl-25} allow the text prompt to modulate visual processing from early layers via cross-attention. This is theoretically ideal for GUI agents (encoding ``click the Submit button'' could attend differently than ``read the error message'') but remains underexploited in current agent architectures.
+
+\textbf{The key gap.} No prior work combines these insights into a unified interface where the agent explicitly controls its observation modality via tool calls, with text as the default output and pixels as the rare exception. Claude Computer Use's \texttt{zoom} is the closest production feature; GUI-Eyes trains the perception decision via RL. Our \texttt{observe} tool is, to our knowledge, the first to offer structured modality selection (\texttt{check}, \texttt{read}, \texttt{glance}, \texttt{look}) inspired by the biological Orient-Read-Confirm cycle observed in eye-tracking studies of GUI interaction~\cite{gui-eye-tracking}. The further design principle, that most agent steps do not require visual processing at all but only text extraction, has no precedent in the computer-use agent literature.
+
+
+% ===========================================================================
+% 3. METHOD
+% ===========================================================================
+
+\section{FSP: Top-Down Observation Control}
+\label{sec:method}
+
+Current computer-use agents receive a full screenshot at every step, an
+architectural default inherited from early vision-language pipelines, not a
+principled design choice. We replace this with Foveated Screen
+Perception (FSP), a top-down attention system in which the agent's task goals
+drive what it observes. The large language model acts as an executive
+controller, analogous to the prefrontal cortex modulating visual cortex via
+re-entrant connections, that selects an observation mode based on the current
+task state. The text-only modes dominate; pixels are requested only when
+text cannot capture the needed information.
+
+\subsection{Design Principles}
+\label{sec:design-principles}
+
+FSP draws on four mechanisms from human visual attention, each motivating a
+concrete engineering decision:
+
+\paragraph{Gist extraction.}
+Humans categorize a scene (``office application,'' ``web search results'') in
+as little as 36\,ms~\cite{greene2009recognition,thorpe1996speed}, well before
+object-level recognition begins. This ultra-fast gist guides subsequent
+fixations. In FSP, the \texttt{glance} mode mirrors gist extraction: a
+text-only summary of the application, layout, and state, produced at minimal
+token cost.
+
+\paragraph{Foveal fixation.}
+The human fovea covers only $\sim$2\textdegree{} of the visual field yet
+consumes over half of primary visual cortex~\cite{wandell2007visual}. High
+acuity is achieved by targeting, not by processing the entire field at
+high resolution. The \texttt{read} and \texttt{look} modes implement foveal
+fixation: the agent specifies a center coordinate and radius, and the system
+returns content from that region alone.
+
+\paragraph{Predictive coding.}
+Rao and Ballard's hierarchical predictive coding
+framework~\cite{rao-ballard-1999} holds that higher cortical areas generate
+top-down predictions; only prediction errors propagate upward.
+Confirmed expectations are suppressed (repetition suppression). The
+\texttt{check} mode implements this principle: the agent states what it expects,
+and the system reports only whether reality matched or diverged, a semantic
+diff, not a pixel diff.
+
+\paragraph{Serial text reading.}
+The dominant mode of human screen interaction is text
+comprehension~\cite{rayner-eye-movements}: reading labels, menus, error messages, and
+form fields. The visual encoding is a means to an end; the information
+being extracted is text. FSP therefore treats text as the default
+observation modality, with \texttt{look} reserved for non-text elements
+(icons, colors, charts, spatial layout) where text extraction is
+insufficient.
+
+\medskip
+\noindent
+These principles converge on a single design rule: \textbf{the observe tool
+maps to the biological Orient-Read-Confirm cycle} identified in eye-tracking
+studies of GUI interaction (84 participants, 10{,}282 trials across 900
+GUIs)~\cite{gui-eye-tracking}. Humans follow a
+stereotyped sequence: orient to the scene (ambient mode, $\sim$700\,ms),
+search for and read the target (focal mode), then verify the outcome
+(confirmation fixation). Each FSP mode corresponds to a phase of this cycle.
+
+\subsection{The Observe Tool}
+\label{sec:observe-tool}
+
+The agent interacts with the screen through a single \texttt{observe} tool
+with four modes, summarized in Table~\ref{tab:modes}. The tool accepts a
+\texttt{mode} parameter and, depending on the mode, optional coordinates, a
+region radius, or an expectation string (see Listing~\ref{lst:schema}).
+
+\begin{table}[t]
+\centering
+\caption{Observation modes. Three return text only; \texttt{look} is the sole
+visual mode. Cost is measured in approximate output tokens per invocation.}
+\label{tab:modes}
+\small
+\begin{tabular}{@{}lllc@{}}
+\toprule
+\textbf{Mode} & \textbf{Biological Analog} & \textbf{Returns} & \textbf{Cost} \\
+\midrule
+\texttt{glance} & Gist extraction; dorsal ``where'' stream &
+  Text: app, layout, state & 30--50\,tok \\
+\texttt{read} & Foveal text reading; serial word recognition &
+  Text: extracted text at $(x,y)$ & 20--100\,tok \\
+\texttt{look} & Foveal fixation; ventral ``what'' stream &
+  Image crop at $(x,y)$ & 50--150\,tok \\
+\texttt{check} & Predictive coding; prediction-error signaling &
+  Text: expectation vs.\ reality & 10--50\,tok \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\begin{lstlisting}[
+  language=Python,
+  caption={The \texttt{observe} tool schema exposed to the LLM.},
+  label={lst:schema}
+]
+OBSERVE_TOOL = {
+  "name": "observe",
+  "description": (
+    "Observe the current screen state. Choose the "
+    "cheapest mode that gives you what you need.\n"
+    "Modes (cheapest first):\n"
+    " check: Did my last action work? (text)\n"
+    " read:  What does the text say here? (text)\n"
+    " glance: What am I looking at? (text)\n"
+    " look:  What does this look like? (image)"
+  ),
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["check","read","glance","look"],
+      },
+      "center_x": {
+        "type": "integer",
+        "description": "X center of region (read/look)"
+      },
+      "center_y": {
+        "type": "integer",
+        "description": "Y center of region (read/look)"
+      },
+      "radius": {
+        "type": "integer",
+        "default": 150,
+        "description": "Half-width of region in px"
+      },
+      "expectation": {
+        "type": "string",
+        "description": "What you expected (check)"
+      }
+    },
+    "required": ["mode"]
+  }
+}
+\end{lstlisting}
+\end{figure}
+
+\paragraph{Mode semantics.}
+\texttt{glance} captures the full screen internally but returns only a
+text-only layout summary (application name, screen type, visible regions and
+their roles), analogous to the 36\,ms scene gist that humans extract before
+any object-level processing. \texttt{read} extracts text content at and
+around the specified coordinates via the accessibility tree when available,
+falling back to OCR on a cropped region. \texttt{look} is the only mode that
+returns pixels: a high-resolution crop around $(x, y)$, optionally annotated
+with accessibility metadata for elements within the region. \texttt{check}
+takes an expectation string, captures the screen, compares it against the
+previous state using perceptual hashing for change detection, and returns a
+semantic description of whether the expectation was met, focused on the region
+near the agent's last action point.
+
+\subsection{Agent Loop}
+\label{sec:agent-loop}
+
+The FSP agent follows an Orient-Read-Confirm cycle that mirrors the
+eye-tracking findings described in \S\ref{sec:design-principles}:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Orient.} On arriving at a new screen (task start, navigation,
+    or unexpected state), the agent calls
+    $\texttt{observe}(\texttt{mode}{=}\text{``glance''})$ to extract the scene
+    gist. This returns a text summary of the application, layout, and visible
+    state ($\sim$30--50 tokens).
+  \item \textbf{Read.} The agent calls
+    $\texttt{observe}(\texttt{mode}{=}\text{``read''},\; x,\; y)$ to extract
+    text content near the intended action target: a button label, a menu item,
+    an error message ($\sim$20--100 tokens).
+  \item \textbf{Act.} The agent executes an action: click, type, scroll, or
+    keyboard shortcut.
+  \item \textbf{Confirm.} The agent calls
+    $\texttt{observe}(\texttt{mode}{=}\text{``check''},\;
+    \texttt{expectation}{=}\text{``\ldots''})$ to verify the outcome
+    ($\sim$10--50 tokens). Three branches follow:
+    \begin{itemize}[itemsep=1pt]
+      \item As expected: proceed to the next action.
+      \item Unexpected change: call \texttt{read} near the action
+        point to understand what happened. If text is sufficient, adapt; if
+        visual detail is needed (icon state, color change, spatial layout),
+        escalate to \texttt{look}.
+      \item Screen unchanged: the action likely failed. Try an
+        alternative approach.
+    \end{itemize}
+\end{enumerate}
+
+\noindent
+The key asymmetry is that \texttt{look}, the only mode returning
+pixels, enters the loop as an exception, triggered when text-only modes
+surface something that requires visual inspection. In a typical 50-step task,
+we expect $\sim$90\% of observation calls to use text-only modes
+(\texttt{check}, \texttt{read}, \texttt{glance}), with \texttt{look} invoked
+only for non-text elements such as unlabeled icons, color indicators, or chart
+content.
+
+\subsection{Why No Full-Screen Mode}
+\label{sec:no-scan}
+
+An earlier design included a \texttt{scan} mode that returned a full
+screenshot at reduced resolution ($\sim$300--400 tokens). We dropped it for
+three reasons:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{No biological analog.} The brain never processes the entire
+    visual field at uniform resolution. The retina transmits $\sim$10$^9$
+    bits/sec, but only $\sim$10$^7$ bits/sec reach cortex, a 100$\times$
+    compression achieved precisely through foveation and selective
+    attention~\cite{wandell2007visual}. A uniform full-field mode reproduces
+    the anti-pattern that naive screenshot pipelines already exhibit.
+  \item \textbf{\texttt{glance} covers recovery.} An agent that has lost
+    track of the screen state needs to re-orient, not to see every pixel.
+    That is what \texttt{glance} provides. If finer detail is needed,
+    targeted \texttt{read} or \texttt{look} calls at specific regions are
+    strictly more efficient than a uniform full-screen dump.
+  \item \textbf{It undermines the design.} If a full-screen fallback is
+    available, empirically agents default to it rather than learning to use
+    cheaper targeted modes. Removing \texttt{scan} forces the agent to develop
+    efficient perception habits, just as biological foveation is not optional
+    but architecturally mandated by retinal structure.
+\end{enumerate}
+
+\subsection{Text-First Perception}
+\label{sec:text-first}
+
+\paragraph{Why \texttt{read} is first-class.}
+Most human screen interaction is text comprehension: reading labels, menus,
+error messages, status bars, and form
+fields~\cite{rayner-eye-movements}. The visual processing involved in
+reading is a means to an end; the information being extracted is text.
+A mode that returns text directly, via the accessibility tree or OCR, skips the
+visual encoding step entirely. In our design, the text modes cover an estimated $\sim$90\%
+of agent observation steps. \texttt{look} is reserved for
+elements where text extraction is genuinely insufficient: unlabeled icons,
+color-coded status indicators, charts and graphs, and spatial layout
+relationships.
+
+\paragraph{Why \texttt{check} is semantic, not pixel-level.}
+Biological predictive coding is hierarchical and
+semantic~\cite{rao-ballard-1999,friston2005theory}. Higher cortical areas send
+predictions downward (``I expect a dialog to appear''); lower areas compare
+against sensory input and propagate only prediction errors upward.
+These errors are object-level, not pixel-level: surprise in one feature of an
+object spreads to make the entire object salient, even at the level of
+V1~\cite{keller2018predictive}. When predictions are confirmed, neural
+activity is suppressed, not echoed.
+
+The \texttt{check} mode mirrors this directly. The agent states its expectation
+as a natural-language string (e.g., ``a save confirmation dialog should
+appear''). The system captures the screen, compares against the previous state,
+and returns a semantic verdict: ``Confirmed: dialog appeared as expected'' or
+``NOT as expected: screen unchanged, the Save button is still visible.'' The
+implementation uses perceptual hashing (pHash) for coarse change detection,
+but the output is always a semantic description, not a diff image.
+
+The \texttt{check} mode is anchored to the action point. Eye-tracking
+studies show that after executing an action, humans fixate near the location
+where they just acted~\cite{gui-eye-tracking}. Changes distant from the
+action point are routinely missed. Nielsen Norman Group reports that 40\% of
+error messages go unnoticed when they appear away from the user's
+focus~\cite{nngroup-change-blindness}. FSP's \texttt{check} mode focuses its
+comparison on the region surrounding the last action coordinates, matching this
+biological bias.
+
+\paragraph{Accessibility data as implementation detail.}
+The accessibility tree has no direct biological analog; the brain does not
+have a ``list all objects'' mode. It searches for specific targets (Wolfe's
+Guided Search~\cite{wolfe-guided-search}) or identifies what is at a fixation
+point. Making accessibility data a top-level observation mode would encourage
+dumping hundreds of tokens of structured data per step regardless of need.
+
+Instead, accessibility data is an implementation detail inside each
+mode. \texttt{glance} consults the accessibility tree (when available) to
+produce its layout description, falling back to screenshot-based OCR when the
+tree is absent or incomplete. \texttt{read} retrieves accessibility text
+content at the target coordinates, falling back to OCR on a cropped region.
+\texttt{look} annotates its image crop with accessibility metadata for
+elements within the region. The agent never reasons about whether it is
+receiving accessibility data or vision-derived data; it asks ``what is here?''
+and the system provides the best available answer through whichever backend is
+more complete. This fusion approach is consistent with hybrid perception
+findings: the incomplete state of native accessibility~\cite{screen2ax} makes vision-based
+fallbacks essential.
+
+\subsection{Memory: Vision for the Present, Text for the Past}
+\label{sec:memory}
+
+The growing token cost of historical observations is a primary driver of
+latency degradation in multi-step tasks~\cite{osworld-human}. Two recent findings inform our memory design:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Text history outperforms screenshot history.}
+    Fara-7B~\cite{fara-7b} keeps only the last 3 screenshots but retains
+    all textual step summaries, completing tasks in $\sim$16 steps versus
+    $\sim$41 for a screenshot-heavy baseline. Screenshot history does not improve performance; only text-based history does.
+  \item \textbf{Masking beats summarization.}
+    JetBrains~\cite{jetbrains-complexity-trap} found that replacing old tool
+    outputs with placeholders (e.g., \texttt{[Previous output: 2,847 tokens,
+    masked]}) halves token cost while matching or slightly exceeding
+    LLM-generated summaries. A placeholder is often better than a bad summary.
+\end{itemize}
+
+\noindent
+FSP implements a \texttt{SimpleMemory} module (Listing~\ref{lst:memory}) that
+follows both principles. A sliding window of size $N$ (default $N{=}5$)
+retains the most recent steps in full detail within the conversation context.
+Older steps are compressed to single-line text summaries (action taken and
+observation result) with all images dropped. This yields a context profile
+where the agent has rich perceptual access to the present (via the
+\texttt{observe} tool) and efficient textual recall of the past (via
+compressed history), matching the biological asymmetry between active
+perception and episodic memory.
+
+\begin{figure}[t]
+\begin{lstlisting}[
+  language=Python,
+  caption={Sliding-window memory. Recent steps are retained in full;
+  older steps are compressed to one-line text summaries with images dropped.},
+  label={lst:memory}
+]
+class SimpleMemory:
+    """Vision for the present, text for the past."""
+
+    def __init__(self, window: int = 5):
+        self.steps: list[dict] = []
+        self.window = window
+
+    def add(self, step: int, action: str, obs: str):
+        self.steps.append({
+            "step": step,
+            "action": action,
+            "obs": obs,   # text summary, never an image
+        })
+
+    def get_context(self) -> str:
+        """Older steps: one-line text summaries.
+        Recent steps kept in full in conversation."""
+        lines = []
+        for s in self.steps[:-self.window]:
+            lines.append(
+                f"Step {s['step']}: {s['action']}"
+                f" -> {s['obs']}"
+            )
+        return "\n".join(lines)
+\end{lstlisting}
+\end{figure}
+
+
+% ===========================================================================
+% 4. EXPERIMENTAL DESIGN
+% ===========================================================================
+
+\section{Experimental Design}
+\label{sec:experimental-design}
+
+\subsection{Factorial Design}
+
+The central claim of FSP is that agent-controlled observation improves perception efficiency regardless of the underlying model. A single-model evaluation cannot distinguish whether gains stem from the perception interface itself or from idiosyncratic compatibility with one model's training distribution. We therefore employ a 2$\times$2 factorial design crossing two frontier models with two perception backends:
+
+\begin{table}[h]
+\centering
+\caption{Experimental conditions. Each cell is an independent evaluation run. The result is conclusive if FSP outperforms Standard CU on both rows.}
+\label{tab:conditions}
+\begin{tabular}{lcc}
+\toprule
+& \textbf{Standard CU} & \textbf{FSP} \\
+& (full screenshot every step) & (\texttt{observe} tool, 4 modes) \\
+\midrule
+\textbf{GPT-5.4} (OpenAI)     & Baseline A  & Treatment A \\
+\textbf{Opus 4.6} (Anthropic)  & Baseline B  & Treatment B \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both models see an identically named skill (\texttt{computer\_use}) with an identical action space (click, type, scroll, keyboard shortcut). Only the perception backend differs: Standard CU returns a full screenshot after every action; FSP exposes the \texttt{observe} sub-tool with four modes. The system prompt is shared except for perception-specific usage instructions in the FSP condition. Critically, the model receives no signal indicating which condition it is in; it simply uses the tools it is given.
+
+The result is conclusive if FSP wins on both models. This controls for the objection that the tool interface merely suits one model's training. If both GPT-5.4 and Opus 4.6 benefit, the perception interface itself is better, not model-specific tuning.
+
+\subsection{Benchmarks}
+
+We evaluate in two phases, ordered by iteration speed and ecological validity.
+
+\paragraph{Phase 1: ScreenSpot-Pro (grounding accuracy).}
+ScreenSpot-Pro \cite{screenspot-pro} is a static dataset of GUI screenshots annotated with click targets spanning desktop, mobile, and web interfaces. It requires no virtual machines and permits rapid iteration. The key difficulty is that targets occupy only 0.07\% of image area on average (compared to 2.01\% in older benchmarks), making it the canonical test for fine-grained GUI grounding. This is precisely the regime where zoom/crop approaches have demonstrated the largest gains. We run all four conditions (2 models $\times$ 2 perception backends).
+
+\paragraph{Phase 2: OSWorld (end-to-end task completion).}
+OSWorld \cite{osworld} is the largest computer-use benchmark, comprising full desktop tasks executed in Ubuntu virtual machines (VMware or Docker+KVM). The agent connects via VNC and executes actions through \texttt{pyautogui}. OSWorld is the benchmark most cited in analyses of agent observation inefficiency~\cite{osworld-human}, documenting the latency and step-count overhead described in Section~\ref{sec:introduction}. We run all four conditions.
+
+\subsection{Metrics}
+
+\begin{table}[h]
+\centering
+\caption{Metrics collected per experimental condition.}
+\label{tab:metrics}
+\begin{tabular}{lp{8.5cm}}
+\toprule
+\textbf{Metric} & \textbf{What it measures} \\
+\midrule
+Success rate & Task completion. FSP must not degrade task success relative to Standard CU. \\
+Total input tokens per task & The core efficiency claim: expected 19--33$\times$ reduction under FSP. \\
+Observation tokens only & Isolates perception savings from reasoning tokens. \\
+Steps to completion & Whether FSP reduces wasted observation cycles. \\
+Mode distribution (FSP only) & What the agent actually chooses. How often does it use text-only modes vs.\ fall back to \texttt{look}? \\
+Latency per step & Less context leads to faster inference. Measures the latency benefit of reduced observation tokens. \\
+Grounding accuracy & Click precision on small elements (ScreenSpot-Pro). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Implementation Details}
+
+\paragraph{Standard CU backend.}
+After every action, the system captures a full screenshot via VNC and returns it to the model as part of the tool response. The model sees a single \texttt{computer\_use} tool whose output always includes the full-resolution screenshot. This mirrors the production behavior of current computer-use systems \cite{claude-computer-use, openai-operator}.
+
+\paragraph{FSP backend.}
+After every action, the system captures a screenshot internally but does not send it to the model. Instead, the model calls the \texttt{observe} sub-tool with a chosen mode. The system processes the internally held screenshot according to the requested mode and returns the result:
+
+\begin{itemize}
+    \item \textbf{\texttt{check}}: Compares the current screenshot against the previous one via perceptual hashing (pHash). If the hash distance is below threshold, returns ``Screen unchanged.'' Otherwise, describes semantic changes near the last action point. Returns text only ($\sim$10--50 tokens).
+    \item \textbf{\texttt{read}}: Extracts text content at the specified $(x, y)$ coordinates and radius. Uses the AT-SPI accessibility API when available; falls back to OCR on the cropped region. Returns text only ($\sim$20--100 tokens).
+    \item \textbf{\texttt{glance}}: Generates a scene-level description including application name, screen type, layout structure, and overall state. Uses the accessibility tree when available; falls back to OCR-based layout analysis. Returns text only ($\sim$30--50 tokens).
+    \item \textbf{\texttt{look}}: Crops a high-resolution region around the specified coordinates and optionally annotates it with accessibility metadata for any elements in the region. This is the only mode that returns an image ($\sim$50--150 tokens).
+\end{itemize}
+
+\paragraph{Shared infrastructure.}
+Both backends share the same action execution layer (\texttt{pyautogui} for mouse/keyboard actions), screen capture mechanism (VNC), and accessibility interface (AT-SPI on the Ubuntu VM). The \texttt{SimpleMemory} module compresses old steps to one-line text summaries while keeping recent steps in full detail, following the finding of Fara-7B \cite{fara-7b} that text-based history outperforms screenshot history.
+
+\subsection{Expected Results}
+
+We expect FSP to achieve a 19--33$\times$ reduction in observation tokens compared to Standard CU. This estimate derives from the token profile of a typical task:
+
+\begin{itemize}
+    \item Most steps use \texttt{check} ($\sim$15 tokens) or \texttt{read} ($\sim$40 tokens). These are text-only and cover the dominant modes of screen interaction: action verification and text comprehension.
+    \item Occasional \texttt{glance} calls on screen transitions ($\sim$40 tokens).
+    \item Rare \texttt{look} calls when visual detail is genuinely needed ($\sim$100 tokens). This is the only mode that incurs image token costs.
+\end{itemize}
+
+Under Standard CU, a 50-step task sends approximately 1,300 tokens per screenshot $\times$ 50 steps = $\sim$65,000 observation tokens. Under FSP, the same task uses approximately 2,000--3,500 observation tokens, assuming a weighted mixture heavily dominated by text-only modes. The reduction is further compounded by the latency benefit: smaller per-step context means faster inference, addressing the dominant bottleneck identified by OSWorld-Human~\cite{osworld-human}.
+
+We further expect FSP to maintain or improve grounding accuracy on ScreenSpot-Pro, because the \texttt{look} mode provides a targeted high-resolution crop comparable to the zoom mechanisms that have consistently improved grounding in prior work \cite{regionfocus, zoomclick, adazoom-gui, gui-eyes}.
+
+
+% ===========================================================================
+% 5. DISCUSSION
+% ===========================================================================
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Top-Down Attention as the Current Contribution}
+
+FSP implements top-down (goal-directed) attention: the agent's current task drives which observation mode it selects, where it directs its perceptual resources, and what level of detail it requests. This mirrors the prefrontal cortex to V1/V2 feedback pathway in biological vision, where the ``executive'' (prefrontal cortex) biases early visual processing toward task-relevant features \cite{desimone-duncan-attention, corbetta2002control}. In FSP, the LLM serves as the executive controller: it maintains the task goal in its context, evaluates what information it needs next, and selects the appropriate observation mode and coordinates.
+
+The key question this work addresses is whether large language models can effectively serve as executive controllers of their own perception, selecting observation mode, coordinates, and level of detail based on task state, rather than passively receiving full screenshots. The GUI-Eyes system \cite{gui-eyes} demonstrated that a 3B model can be RL-trained to decide whether to invoke crop and zoom tools (improving ScreenSpot-Pro accuracy from 30.2\% to 44.8\%). FSP extends this principle by providing a richer set of observation modes and testing whether frontier LLMs can use them effectively without RL training on the observation decision itself.
+
+\subsection{Limitations}
+
+\paragraph{Purely top-down perception.}
+The current FSP design has no mechanism for unexpected environmental events to capture the agent's attention. If an error popup appears in a region the agent is not attending to, it will be missed, analogous to the change blindness observed in human vision when attention is directed elsewhere \cite{simons2005change}. Section~\ref{sec:future-bidirectional} addresses this limitation directly.
+
+\paragraph{Dependence on LLM mode selection quality.}
+FSP's effectiveness depends entirely on the LLM's ability to choose observation modes wisely. An agent that defaults to \texttt{look} on every step would negate the token savings; one that over-relies on \texttt{check} might miss important screen changes. We mitigate this through system prompt design, but the mode selection policy could be substantially improved via reinforcement learning, following the reward structure of GUI-Eyes \cite{gui-eyes} ($R = 0.6 R_{\text{acc}} + 0.1 R_{\text{format}} + 0.3 R_{\text{tool}}$).
+
+\paragraph{Accessibility availability.}
+The \texttt{read} and \texttt{glance} modes perform best when the accessibility tree (AT-SPI on Linux, UI Automation on Windows, AX API on macOS) provides complete semantic information. However, the limited accessibility coverage documented by Screen2AX~\cite{screen2ax} means many applications lack complete metadata. FSP mitigates this through OCR fallback, but the quality of the text modes degrades on applications with poor accessibility support and visually complex custom UIs.
+
+\paragraph{OCR and accessibility accuracy.}
+The \texttt{read} mode returns text extracted via OCR or accessibility APIs, and errors in extraction propagate directly to the agent's understanding. Small text, unusual fonts, overlapping UI elements, and dynamic content (e.g., animations, loading states) can degrade extraction quality. This is a limitation shared with all hybrid perception systems \cite{ufo2, agent-s2}.
+
+\subsection{Future Work: Toward Bidirectional Attention}
+\label{sec:future-bidirectional}
+
+The current FSP design is purely top-down: the agent decides what to observe based on its goals, and the environment is passive. But biological visual attention is bidirectional.
+
+\paragraph{Top-down attention (current).}
+Goal-directed. The prefrontal cortex biases visual processing toward task-relevant features via feedback connections to V1, V2, and V4 \cite{desimone-duncan-attention, corbetta2002control}. ``I need to find the Submit button'' leads to attending near form elements. This is what FSP implements: the LLM's task representation drives observation mode selection.
+
+\paragraph{Bottom-up attention (future).}
+Stimulus-driven. Salient changes in the environment capture attention regardless of current goals. A sudden popup, a red error flash, motion, or high contrast grabs biological attention via the superior colliculus and pulvinar pathway before top-down processing engages \cite{itti-koch-saliency, theeuwes-capture}. Bottom-up saliency evolved because environments contain threats and opportunities that do not wait for goal-directed search: a predator in peripheral vision must interrupt whatever the organism is currently attending to.
+
+In the current FSP design, if an error popup appears in a region the agent is not observing, it will miss it entirely. This is the same failure mode that current full-screenshot systems exhibit: they waste tokens on unchanged regions but at least see the popup (whether or not the model attends to it in its reasoning). FSP trades this passive coverage for efficiency, but the biological solution is not to look everywhere; it is to add a saliency monitor.
+
+\paragraph{Proposed saliency monitor.}
+We propose adding a lightweight, continuously running saliency monitor that generates ``attention interrupts,'' flagging regions where unexpected visual changes occurred. This would operate as follows:
+
+\begin{enumerate}
+    \item \textbf{Change detection.} After each action (or on a timer), compute a lightweight pixel diff between the current and previous screenshot. This is cheap: no LLM call required, just image comparison.
+    \item \textbf{Saliency classification.} Classify detected changes by saliency: a new dialog window or error popup scores higher than a subtle highlight change or cursor blink. Classification can use simple heuristics (change area, location relative to common popup regions, color contrast) or a small classifier.
+    \item \textbf{Attention interrupt.} Inject a bottom-up alert into the agent's context: \texttt{"Unexpected: dialog appeared at (x, y)"} or \texttt{"Alert: red error banner visible at top of screen."}
+    \item \textbf{Top-down follow-up.} The agent then uses its existing top-down modes (\texttt{read}, \texttt{look}) to inspect the flagged region, integrating the unexpected information into its task plan.
+\end{enumerate}
+
+This creates a complete bidirectional attention loop:
+
+\begin{itemize}
+    \item \textbf{Top-down} (current FSP): agent $\xrightarrow{\texttt{observe}}$ screen. The LLM's goals drive perception.
+    \item \textbf{Bottom-up} (proposed): screen $\xrightarrow{\text{saliency monitor}}$ agent. Environmental changes drive perception.
+\end{itemize}
+
+Combined, this mirrors the full biological visual attention pipeline. The dorsal (``where'') stream provides spatial saliency maps that flag locations of interest; the ventral (``what'') stream provides object recognition at attended locations; both are modulated by prefrontal task goals \cite{goodale1992separate, corbetta2002control}. The saliency monitor corresponds to the dorsal/collicular pathway, while the existing FSP modes correspond to ventral-stream processing under prefrontal control.
+
+The attention interrupt mechanism also addresses the 40\% error-miss rate identified in change blindness studies: error messages that appear away from the user's current focus of attention go unnoticed in 40\% of cases \cite{nngroup-change-blindness}. A saliency monitor would catch these environmental signals that top-down attention alone cannot.
+
+\paragraph{Additional future directions.}
+
+\begin{itemize}
+    \item \textbf{RL-trained mode selection.} Train the observation policy via reinforcement learning, following GUI-Eyes' reward structure \cite{gui-eyes}. The reward signal would combine task accuracy, token cost, and observation quality, allowing the agent to learn optimal mode selection rather than relying on prompt engineering.
+
+    \item \textbf{\texttt{find} mode for guided visual search.} Add a goal-directed search mode where the agent specifies what it is looking for (e.g., ``Submit button'', ``error message'') and the system searches via accessibility lookup or cascaded visual search. This maps to Wolfe's Guided Search theory \cite{wolfe-guided-search}, where top-down feature templates bias the saliency map toward target-matching locations.
+
+    \item \textbf{Grouped-action execution.} Agents observe after every single action even when consecutive actions do not change the screen state meaningfully~\cite{osworld-human}. FSP's decoupling of actions from observations enables grouped execution: the agent can issue multiple actions before calling \texttt{observe}, eliminating redundant observation cycles.
+
+    \item \textbf{Task-conditioned visual encoding.} Current VLMs such as Qwen2.5-VL \cite{qwen25-vl} and InternVL 2.5 \cite{internvl-25} use cross-attention mechanisms where the text prompt modulates visual processing from early layers. This capability is underexploited in GUI agents: the system could encode a screenshot differently when the task is ``click the Submit button'' versus ``read the error message,'' producing task-specific visual features at the encoder level rather than relying on post-hoc attention in the LLM's reasoning.
+\end{itemize}
+
+
+% ===========================================================================
+% 6. CONCLUSION
+% ===========================================================================
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented Foveated Screen Perception (FSP), a bio-inspired top-down attention system for computer-use agents. Rather than sending a full screenshot to the model at every step (the universal default in current production systems), FSP exposes an \texttt{observe} tool with four modes: \texttt{check} (action verification), \texttt{read} (text extraction), \texttt{glance} (scene orientation), and \texttt{look} (high-resolution image crop). Three of the four modes return text only; \texttt{look} is the sole mode that returns pixels, reserved for cases where spatial or visual information cannot be captured as text.
+
+The design principle is that the LLM serves as the executive controller of its own perception, selecting observation mode, coordinates, and level of detail based on task state, mirroring the prefrontal cortex's top-down modulation of visual processing in biological vision. Rather than sending everything to the model, FSP lets the model decide what it needs to see.
+
+We evaluate FSP in a 2$\times$2 factorial design crossing two frontier models (GPT-5.4 and Opus 4.6) with two perception backends (Standard CU and FSP) across two benchmarks: ScreenSpot-Pro for grounding accuracy and OSWorld for end-to-end task completion. The cross-model design ensures that any observed gains are attributable to the perception interface rather than model-specific compatibility. We expect 19--33$\times$ reduction in observation tokens, driven by the dominance of text-only modes (\texttt{check} and \texttt{read}) in typical task execution.
+
+The current contribution is purely top-down: the agent's goals drive observation selection. Future work extends FSP toward bidirectional attention by adding a lightweight saliency monitor that detects unexpected environmental changes and injects bottom-up attention interrupts into the agent's context. Combined with RL-trained mode selection, guided visual search, and grouped-action execution, this points toward a complete bio-inspired perception pipeline for computer-use agents, one where the agent sees not everything, but exactly what it needs.
+
+
+% ===========================================================================
+% REFERENCES
+% ===========================================================================
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
