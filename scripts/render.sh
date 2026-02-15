@@ -6,14 +6,14 @@
 #   <repo>/main.tex            - LaTeX source
 #   <repo>/references.bib      - BibTeX references
 #   <repo>/scripts/render.sh   - this script
-#   <repo>/build/main.pdf      - generated PDF
-#   <repo>/build/index.html    - generated HTML (GitHub Pages compatible)
+#   <repo>/docs/main.pdf      - generated PDF
+#   <repo>/docs/index.html    - generated HTML (GitHub Pages compatible)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD_DIR="$REPO_ROOT/build"
+DOCS_DIR="$REPO_ROOT/docs"
 
 for tool in tectonic pandoc; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -23,13 +23,13 @@ for tool in tectonic pandoc; do
 done
 
 cd "$REPO_ROOT"
-mkdir -p "$BUILD_DIR"
+mkdir -p "$DOCS_DIR"
 
-echo "[1/2] tectonic: main.tex -> build/main.pdf"
-tectonic main.tex --outdir="$BUILD_DIR"
-echo "      -> $BUILD_DIR/main.pdf ($(ls -lh "$BUILD_DIR/main.pdf" | awk '{print $5}'))"
+echo "[1/2] tectonic: main.tex -> docs/main.pdf"
+tectonic main.tex --outdir="$DOCS_DIR"
+echo "      -> $DOCS_DIR/main.pdf ($(ls -lh "$DOCS_DIR/main.pdf" | awk '{print $5}'))"
 
-echo "[2/2] pandoc:   main.tex -> build/index.html"
+echo "[2/2] pandoc:   main.tex -> docs/index.html"
 pandoc main.tex \
   --from=latex \
   --to=html5 \
@@ -42,7 +42,7 @@ pandoc main.tex \
   --metadata=lang=en \
   --shift-heading-level-by=1 \
   --syntax-highlighting=tango \
-  --output="$BUILD_DIR/index.html"
-echo "      -> $BUILD_DIR/index.html ($(ls -lh "$BUILD_DIR/index.html" | awk '{print $5}'))"
+  --output="$DOCS_DIR/index.html"
+echo "      -> $DOCS_DIR/index.html ($(ls -lh "$DOCS_DIR/index.html" | awk '{print $5}'))"
 
 echo "Done."

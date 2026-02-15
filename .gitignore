@@ -12,5 +12,5 @@
 *.fdb_latexmk
 *.synctex.gz
 
-# build/ contains rendered outputs (main.pdf, index.html).
-# These are tracked so GitHub Pages can serve them without running the build.
+# docs/ contains rendered outputs (main.pdf, index.html).
+# These are tracked so GitHub Pages can serve them from the /docs source.

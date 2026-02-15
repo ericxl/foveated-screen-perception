@@ -30,7 +30,7 @@
   \texttt{xiaoyong@utexas.edu}
 }
 
-\date{April 2026}
+\date{February 2026}
 
 \begin{document}
 \maketitle
@@ -194,7 +194,7 @@ Our work draws on several threads of biological and bio-inspired vision research
 
 \textbf{Dual-stream (magno/parvo) neural networks.} A small literature implements the magnocellular/parvocellular split as parallel branches of a neural network. Choi et al.~\cite{choi-dualstream-neurips23} introduce \emph{WhereCNN} (coarse, wide field, motion-biased) and \emph{WhatCNN} (fine, narrow field, color-biased) and show that this split reproduces the functional segregation observed in primate dorsal and ventral pathways. Ibrayev et al.~\cite{ibrayev-twostream-foveation} propose a two-stream foveation-based active vision model in which a dorsal-style stream selects fixation locations while a ventral-style stream performs recognition, evaluated on classification benchmarks. SUGARL~\cite{sugarl} trains an active-vision RL agent in Atari with concurrent peripheral and foveal inputs and learns a policy over fixation location. All of these systems operate on passive classification, robotics, or game environments; the modality choice is either internal to the model or an RL-trained continuous parameter. None exposes a discrete peripheral-vs-foveal modality as an agent-facing tool call, and none has been applied to GUI observation.
 
-\textbf{Predictive coding networks.} Salvatori et al.~\cite{salvatori-pctransformers} introduced PC-Transformers at ICLR 2024, implementing predictive coding within transformer architectures so that only prediction errors propagate through the network. This maps directly to the concept of change-based observation (processing only what is unexpected after an action) but has not been used for agent observation control. Our \texttt{check} mode operationalizes this principle: the agent states its expectation, and the system reports only the prediction error.
+\textbf{Predictive coding networks.} Salvatori et al.~\cite{salvatori-pctransformers} introduced PC-Transformers at ICLR 2024, implementing predictive coding within transformer architectures so that only prediction errors propagate through the network. This maps directly to the concept of change-based observation (processing only what is unexpected after an action) but has not been used for agent observation control. Our \texttt{scan} mode operationalizes this principle by annotating the grayscale wide-field image with the regions that changed since the last scan, folding action-verification into the same magnocellular-style call that provides orientation, rather than making it a separate mode.
 
 \textbf{Active vision.} Descendants of the Recurrent Attention Model (RAM)~\cite{mnih-ram}, including Active Vision Transformers~\cite{active-vit}, learn sequential fixation policies via reinforcement learning, selecting where to look next based on task requirements. GUI-Eyes~\cite{gui-eyes} is the closest existing system to this paradigm in the GUI domain, training perception-tool usage via RL. Our approach differs by providing a fixed menu of biologically motivated modes rather than learning the perception policy from scratch.
 
