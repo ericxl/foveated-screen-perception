@@ -12,5 +12,5 @@
 *.fdb_latexmk
 *.synctex.gz
 
-# Keep the PDF (we want it in the repo for GitHub Pages)
-# !paper/main.pdf
+# build/ contains rendered outputs (main.pdf, index.html).
+# These are tracked so GitHub Pages can serve them without running the build.

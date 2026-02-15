@@ -6,7 +6,9 @@ Current computer-use agents send a full screenshot (~1,300 tokens on Claude, ~76
 
 This is not just wasteful -- it actively hurts performance. The OSWorld-Human study (ICML 2025) found that **planning and reflection calls consume 75-94% of total task latency**, with each successive step taking up to 3x longer due to growing context. Perhaps most critically: **screenshot-only history does not improve performance -- only text-based history helps.** Agents take 1.4-2.7x more steps than human-optimal trajectories, and the dominant failure mode across OSWorld, ScreenSpot-Pro, and WindowsAgentArena is **GUI grounding errors** -- misclicking or selecting wrong elements.
 
-Human vision solves the bandwidth problem with five mechanisms: foveation (high-res center, blurry periphery), saccades (targeted jumps), top-down attention (task-biased filtering), predictive coding (only process what's unexpected), and gist extraction (scene category in 36ms). The human retina sends ~10^9 bits/sec but only ~10^7 bits/sec reach cortex -- a 100x compression before conscious processing ever begins.
+Human vision solves the bandwidth problem with a particular architectural trick: **the retina does not send one signal to cortex, it sends at least three**. Rods (~120M cells) drive a low-resolution grayscale wide-field stream (magnocellular, dorsal, "where"); cones (~6M cells) drive a high-resolution color stream concentrated at the fovea (parvocellular, ventral, "what"); and text reading is handled by a specialized cortical area (the Visual Word Form Area) that extracts symbolic content from the ventral stream. This decomposition achieves a ~100x bandwidth reduction (~10^9 bits/sec retinal to ~10^7 bits/sec cortical) before any conscious processing begins.
+
+The three streams are not redundant, they are complementary. The magno/rod stream is cheap precisely because it drops color and resolution. The parvo/cone stream pays for color and resolution only where it matters (the fovea). The VWFA bypasses pixels entirely for text. A computer-use agent that sends one full-color full-resolution frame every step is discarding the compression strategy evolution spent half a billion years tuning.
 
 ## What the field has tried (prior work)
 
@@ -18,6 +20,8 @@ Two exceptions stand out:
 
 - **Claude Computer Use** (`computer_20251124`): Adds a `zoom` action that returns a cropped, upscaled region. The only production API where the model itself can choose to look at a sub-region. Claude's OSWorld score reached ~72.5% (late 2025), roughly 2x the previous best.
 - **GUI-Eyes** (Jan 2026): The first system where the agent is RL-trained to decide whether and how to invoke perception tools (`crop` and `zoom`). Reward: R = 0.6*R_acc + 0.1*R_format + 0.3*R_tool, where R_tool combines spatial proximity and region IoU. A 3B model with GUI-Eyes reaches 44.8% on ScreenSpot-Pro -- vs 30.2% without.
+
+Every one of these systems stays within a single image modality. None exposes a color-vs-grayscale choice, a peripheral-vs-foveal choice, or a pixels-vs-text choice as a tool parameter.
 
 ### Zoom/crop is a free lunch for grounding
 
@@ -33,7 +37,7 @@ The evidence is now overwhelming that letting agents zoom into regions dramatica
 | **LASER** (Sep 2025) | Self-evolving preference optimization for crop policy via Monte Carlo rollouts | Qwen2.5-VL-7B: 26.8% -> 47.5% (+20.7pp) |
 | **SpiritSight** (CVPR 2025) | Universal Block Parsing: block-local coordinates in 448x448 patches, eliminating coordinate ambiguity | 80.7% AMS on AMEX, 87.6% on AndroidControl |
 
-The small-element problem is the core driver: ScreenSpot-Pro targets occupy only **0.07%** of image area (vs 2.01% in older benchmarks). Zooming eliminates irrelevant visual context around tiny targets -- the single highest-leverage intervention for grounding.
+The small-element problem is the core driver: ScreenSpot-Pro targets occupy only **0.07%** of image area (vs 2.01% in older benchmarks). Zooming eliminates irrelevant visual context around tiny targets -- the single highest-leverage intervention for grounding. But these systems all operate at full color fidelity. None has asked whether color is even needed for the "where is my target?" step that precedes the crop.
 
 ### Accessibility-tree vs vision vs hybrid
 
@@ -66,65 +70,58 @@ The growing context of historical observations is what causes exponential latenc
 - **Foveated vision transformers** (FovealNet, log-polar ViTs): 30-50% FLOP reduction on ImageNet. None applied to GUI/screen understanding yet.
 - **Predictive coding networks** (PC-Transformers, Salvatori et al. ICLR 2024): Process only prediction errors. Directly maps to the "diff" concept but no one has used it for agent observation.
 - **Active vision** (RAM descendants, Active Vision Transformers): Sequential fixation policies via RL. The GUI-Eyes system is the closest to this in practice.
-- **Task-conditioned visual encoding** (Qwen2.5-VL, InternVL 2.5): Text prompt modulates visual processing from early layers. Theoretically ideal for GUI agents but underexploited -- could encode "click the Submit button" differently than "read the error message."
-- **Visual working memory in AI:** Nearly nonexistent for GUI agents. Standard systems pile screenshots into the token window with no compression. Your `SimpleMemory` (compress old steps to one-liners, keep recent in full) has no direct precedent in the GUI agent literature.
+- **Two-stream architectures**: Simonyan & Zisserman's two-stream networks (spatial + temporal) for action recognition are structurally analogous to magno/parvo, but the split is along a different axis (RGB vs optical flow) and the agent never sees the streams -- they are fused internally.
+- **Visual working memory in AI:** Nearly nonexistent for GUI agents. Standard systems pile screenshots into the token window with no compression.
 
-**The gap:** Nobody has published a system where the agent explicitly controls its observation modality via tool calls. Claude's `zoom` is the closest production feature. GUI-Eyes trains the decision via RL. Our proposed `observe` tool with mode selection would be novel. The further insight -- that most modes should return **text only**, with image crops as the rare exception -- has no precedent. Every existing system treats the screenshot as the primary observation; we treat text as primary and pixels as fallback.
+**The gap:** Nobody has published a GUI agent system where the agent explicitly picks between a low-fidelity grayscale wide-field view and a high-fidelity color foveal view -- the two canonical streams of primate vision. Claude's `zoom` is the closest production feature. GUI-Eyes trains the decision via RL. Every existing system treats the screenshot as one monolithic observation -- full RGB, uniform resolution, all at once. The retina does not work that way, and neither should an efficient agent.
 
 ---
 
 ## The design: LLM chooses how to look
 
-Instead of force-feeding the LLM a screenshot every step, we give it an `observe` tool with a `mode` parameter. **The LLM is the CEO -- it decides what kind of observation it needs.**
+Instead of force-feeding the LLM a screenshot every step, we give it an `observe` tool with three modes. **The three modes map one-to-one onto the three streams the primate retina sends to cortex.** The LLM is the CEO -- it picks which stream it needs.
 
-### Why these modes? Mapping biology to engineering
+### Three streams of biological vision, three modes
 
-The modes are designed to mirror the **Guess-Scan-Confirm** cycle observed in eye-tracking studies of GUI interaction (84 participants, 10,282 trials across 900 GUIs). Humans follow a stereotyped sequence: orient to the scene (ambient mode, ~700ms) -> search for the target (focal mode, guided search) -> verify the action succeeded (predictive coding / confirmation fixation). Each mode maps to a phase:
+The human retina outputs roughly three parallel streams. Each is optimized for a different kind of information, and each has a characteristic bandwidth:
 
-| Phase | Bio Mechanism | Agent Implementation | What It Returns | Cost |
-|-------|--------------|---------------------|-----------------|------|
-| **Orient** | Gist extraction (36-100ms) + ambient mode (large saccades, short fixations, dorsal "where" stream) | `glance` mode | **Text only.** App name, screen type, layout structure, overall state. No image -- humans store a semantic gist, not a low-res snapshot. | ~30-50 tokens |
-| **Read** | Foveal text reading -- serial word recognition at fixation point. The dominant mode of human screen interaction. | `read` mode | **Text only.** Extracted text content at/around (x, y) coordinates via OCR or a11y. Most screen use is text comprehension; visual encoding is just a means to this end. | ~20-100 tokens |
-| **Inspect** | Foveal fixation on non-text elements -- icons, spatial relationships, color cues, charts. Ventral "what" stream. | `look` mode | **Image crop** around (x, y). The only mode that returns pixels. Used when text extraction isn't enough. | ~50-150 tokens |
-| **Confirm** | Predictive coding (Rao & Ballard 1999). Brain generates prediction -> only prediction errors propagate. Object-level, not pixel-level | `check` mode | **Text only.** Semantic diff anchored to action point. Agent states expectation; system reports whether met or violated. | ~10-50 tokens |
+| Retinal / cortical stream | What it is good at | Why it is cheap | Agent mode | Returns | Cost |
+|---|---|---|---|---|---|
+| **Rods -> magnocellular -> dorsal ("where")** | Spatial layout, motion, luminance contrast | Achromatic (1 channel) + low spatial resolution + massive convergence (~100:1 rod-to-ganglion) | `scan` | Low-res grayscale of full screen, with change annotations since last scan | ~200 tokens |
+| **Cones -> parvocellular -> ventral ("what")** | Color, fine detail, object identity | High fidelity but only over the ~2 degree foveal window | `focus` | High-res full-color crop at (x, y) | ~150 tokens |
+| **VWFA (Visual Word Form Area)** | Symbolic text recognition | Bypasses pixel encoding for words | `read` | Extracted text content at (x, y) | ~40 tokens |
 
-### Why NOT `elements` as a primary mode
+**The efficiency argument is physical, not handwavy.** Grayscale is literally one channel instead of three. A low-resolution sweep has linearly fewer pixels than a full-res frame. A foveal crop touches only ~1/20th of a 1920x1080 screen. Text extraction replaces a 2D pixel array with a 1D token sequence. Every choice mirrors a compression trick the retina already makes, and every choice drops the token cost by an order of magnitude or more against the naive "send one RGB screenshot" baseline.
 
-The accessibility tree has **no biological analog**. The brain doesn't have a "list all objects" mode -- it searches for specific targets (Wolfe's Guided Search) or identifies what's at a specific fixation point (focal recognition). Making `elements` a top-level mode encourages the anti-pattern of dumping 200-300 tokens of structured data every step regardless of need.
+**The biological argument is not ornament, it is the constraint that forced the design.** An earlier iteration of this work had four modes (`glance`, `read`, `check`, `look`). We collapsed them to three because biology does not provide a fourth stream. There is no brain region that produces a text description of the whole screen (`glance` with text layout output was an LLM-friendly fiction); there is no separate "did my action succeed?" module (that is what the magnocellular motion channel does, once per saccade). Keeping only streams that the retina actually has forces the design to be both simpler and more faithful to the compression strategy it is imitating.
 
-Instead, accessibility data is an **implementation detail** of how `read` and `glance` work internally:
-- `glance` uses a11y tree (when available) to generate its layout description. Falls back to screenshot + OCR when a11y is absent.
-- `read` uses a11y text content at the target coordinates when available. Falls back to OCR on a cropped region.
-- `look` uses a11y element data to annotate the crop (if an element at the target coordinates has a11y metadata, include it). Falls back to pure vision.
-- A `find` mode (V2) would use a11y for lookup by name, falling back to visual search.
+### Why `scan` is grayscale and low-resolution
 
-The agent never needs to think about whether it's getting accessibility data or vision data. It asks "what's here?" and the system gives it the best available answer.
+Rods see in grayscale because rhodopsin is a single photopigment. They are numerous (~120M) and heavily multiplexed: up to 100 rods converge onto a single ganglion cell. This gives them exquisite sensitivity at the cost of resolution and color. The magnocellular ganglion cells they feed have large receptive fields, respond transiently to luminance changes, and carry the dominant motion signal to V1.
 
-### Why NO `scan` mode
+For a computer-use agent, this stream answers questions like: "Is there a new window?", "Did a dialog just appear?", "What is the overall layout?", "Is something blinking or animating?" None of these require color, and none require 1920x1080 resolution. A 480x270 grayscale image is enough. The token cost drops by ~5-10x versus a full-color full-res frame, with effectively no loss of spatial-layout and motion information.
 
-The original design included a `scan` mode (full screenshot at reduced resolution, ~300-400 tokens) as a "recovery" option. This was dropped because:
+Because the magnocellular stream is temporally transient -- it responds to changes -- `scan` also returns a text annotation of regions that changed since the last scan ("Dialog appeared near (1200, 400)"). This is the agent-facing analog of motion/change detection in the dorsal stream, and it makes `scan` a natural choice both for orienting at a new screen and for verifying an action.
 
-1. **No biological analog.** The brain never processes the entire visual field at uniform high resolution. "See everything at once" is exactly the anti-pattern the naive screenshot approach already exhibits.
-2. **`glance` covers recovery.** An agent that is "lost" needs to re-orient -- that's what `glance` does. If more detail is needed, targeted `read` or `look` calls at specific regions are more efficient than dumping the whole screen.
-3. **It's a crutch that undermines the design.** If `scan` is available, agents will default to it instead of learning to use cheaper modes. Removing it forces the agent to develop better perception habits.
+### Why `focus` is color, high-resolution, and local
 
-### Why `read` is a first-class mode
+Cones are the opposite design choice: three photopigments (L, M, S) for color, packed densely in the ~2 degree fovea, with near 1:1 cone-to-ganglion ratios. They feed the parvocellular stream, which specializes in high spatial-frequency color-opponent signals -- exactly what object recognition and fine discrimination need.
 
-Most human screen interaction is **text comprehension**: reading labels, menus, error messages, form fields, status text. When you read text on a screen, the visual processing is just a means to an end -- the information being extracted *is* text. Having a mode that returns text directly (via OCR or a11y) skips the visual encoding step entirely.
+For a computer-use agent, this stream answers questions like: "What color is this indicator?", "What icon is this?", "What does this chart show?", "Is this pixel-perfect UI element aligned?" These require full fidelity, but only at a point -- the same asymmetry the fovea exploits. A 300x300 full-color crop is about 1/23rd of a full screen. The token cost is several times cheaper than a full RGB screenshot, and the high fidelity at the point of interest is exactly what small-element grounding benchmarks (ScreenSpot-Pro, 0.07% target area) reward.
 
-This is the mode that was most conspicuously missing from the original design. Three of four modes now return **text only**, with `look` (image crop) as the exception used only when spatial/visual information can't be captured as text (unlabeled icons, color indicators, charts, spatial layout relationships).
+### Why `read` is its own mode
 
-### Why `check` is NOT a pixel diff
+Reading is a cultural skill, not an evolutionary one -- writing is about 5,000 years old, the fovea is ~500 million. But the brain solved it anyway by dedicating a patch of left fusiform cortex (the Visual Word Form Area, VWFA) to extracting symbolic text from the ventral stream. Functionally, VWFA takes high-res foveal input and emits a string of letters; the downstream language cortex works on strings, not pixels.
 
-Biological predictive coding is fundamentally different from SSIM or perceptual hashing:
+For an agent, an OCR or accessibility-API lookup is functionally equivalent to the VWFA: it takes a region of pixels (or in the a11y case, skips the pixels entirely) and returns a string of text. Most human screen interaction is text comprehension -- eye-tracking studies show that over 70% of fixation time is spent on textual elements. Giving the agent a mode that returns text directly, at ~40 tokens per call, skips the parvocellular and VWFA stages altogether. The text *is* the information; the pixels were only ever a carrier.
 
-- The brain generates **hierarchical predictions**: higher cortex sends "I expect a dialog box here" downward; lower areas compare against actual input and send **prediction errors** upward.
-- Errors are **semantic, not pixel-level**: surprise in one feature of an object spreads to make the entire object unexpected. Even V1 responds to high-level prediction violations.
-- When predictions match, neural activity is **suppressed** (repetition suppression). The default is "nothing to report."
+### Why no `check` mode
 
-`check` mirrors this: the agent states what it expected ("a save dialog should appear"), and the system reports whether reality matched or diverged. The implementation can use pixel-level diff for initial change detection, but the output is always semantic: "Dialog appeared as expected" or "No dialog appeared -- screen unchanged. The Save button is still visible at [e12]."
+The previous design had a dedicated `check` mode for predictive-coding-style action verification: "I expected a save dialog; did it appear?" We dropped it because the biological mechanism it imitated -- change detection in the magnocellular stream after a saccade or motor action -- is already what `scan` does. A `scan` after an action returns a grayscale image plus "Changes since last scan: dialog appeared at (x, y)". The agent reads both and decides whether that matches its expectation, using the same language-reasoning it uses for every other decision. A separate mode would be duplication.
 
-This is anchored to the action point because eye-tracking shows humans fixate near where they just clicked for verification. Changes far from the action point are routinely missed -- **40% of error messages go unnoticed** when they appear away from the user's focus (NN/g change blindness study).
+### Why no `glance` mode
+
+The previous design had a `glance` mode that returned a text layout description generated from the a11y tree or from OCR over the whole screen. We dropped it because it inverts the biology in an unhelpful way: biological scene gist is visual (36 ms of low-spatial-frequency magnocellular activity before any object recognition), not a paragraph of sentences. Modern VLMs can read a low-res grayscale image much more naturally than they can consume a synthesized text description of a screen; the translation step was adding latency and information loss for no real benefit. `scan` returns the grayscale image directly, and the LLM's visual encoder does the gist extraction.
 
 ### The `observe` tool schema
 
@@ -132,44 +129,38 @@ This is anchored to the action point because eye-tracking shows humans fixate ne
 OBSERVE_TOOL = {
     "name": "observe",
     "description": (
-        "Observe the current screen state. Choose the cheapest mode "
-        "that gives you what you need. Three modes return text only; "
-        "one returns an image.\n\n"
-        "Modes (cheapest to most expensive):\n"
-        "- 'check': Did my last action work? (~10-50 tokens, text only). "
-        "  Provide your expectation. Best after routine actions.\n"
-        "- 'read': What does the text say here? (~20-100 tokens, text only). "
-        "  Extracts text content at/around coordinates. Best for labels, "
+        "Observe the screen. Pick the cheapest mode that gives you "
+        "what you need. Three modes, matching the three streams the "
+        "retina sends to cortex:\n\n"
+        "- 'read': What does the text say here? (~40 tokens, text only). "
+        "  Extracts text at coordinates via a11y or OCR. Use for labels, "
         "  menus, error messages, form fields -- most screen interaction.\n"
-        "- 'glance': What am I looking at? (~30-50 tokens, text only). "
-        "  App type, layout, state. Best when arriving at a new screen.\n"
-        "- 'look': What does this look like? (~50-150 tokens, image). "
-        "  High-res crop. Only mode that returns pixels. Best for icons, "
-        "  colors, charts, spatial relationships that text can't capture."
+        "- 'scan': Where are things? What changed? (~200 tokens, grayscale). "
+        "  Low-res grayscale of the whole screen plus annotations of "
+        "  changes since last scan. Use to orient or to verify actions.\n"
+        "- 'focus': What does this look like in detail? (~150 tokens, color). "
+        "  High-res full-color crop at coordinates. Use for icons, colors, "
+        "  charts, and fine visual layout that grayscale cannot capture."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["check", "read", "glance", "look"],
+                "enum": ["read", "scan", "focus"],
             },
             "center_x": {
                 "type": "integer",
-                "description": "For 'read'/'look': X center of region"
+                "description": "For 'read'/'focus': X center of region"
             },
             "center_y": {
                 "type": "integer",
-                "description": "For 'read'/'look': Y center of region"
+                "description": "For 'read'/'focus': Y center of region"
             },
             "radius": {
                 "type": "integer",
                 "default": 150,
-                "description": "For 'read'/'look': half-width of region in pixels"
-            },
-            "expectation": {
-                "type": "string",
-                "description": "For 'check': what you expected to happen"
+                "description": "For 'read'/'focus': half-width in pixels"
             }
         },
         "required": ["mode"]
@@ -177,34 +168,28 @@ OBSERVE_TOOL = {
 }
 ```
 
-### How the modes flow (the agent loop)
+### The agent loop
 
 ```
 New screen or navigation
-  -> glance (orient: "what am I looking at?" -- text only)
-  -> read (extract text near target: "what does this say?" -- text only)
+  -> scan (orient: grayscale full-screen; see layout and any changes)
+  -> read (extract text near the target element)
   -> act (click, type, scroll, keyboard shortcut)
-  -> check (verify: "I expected the form to submit" -- text only)
-    -> if check says "as expected": proceed to next action
-    -> if check says "unexpected": read or look at what changed
-    -> if check says "screen unchanged": action failed, try alternative
+  -> scan (verify: grayscale full-screen; check what changed near the action point)
+    -> change matches expectation: proceed
+    -> no change: action failed, try alternative
+    -> unexpected change:
+         -> read the new text; if enough, proceed
+         -> if visual detail needed (icon state, color, chart): focus the region
   -> repeat
 ```
 
-`look` (the only visual mode) is the exception, not the default -- used when check/read surface something that needs spatial or visual inspection:
+`focus` (full-color crop) is the exception, not the default. It is called only when `read` and `scan` surface something that text and grayscale cannot resolve. This matches the biological asymmetry: most of the brain's visual bandwidth budget is spent on the magnocellular stream plus text reading; detailed color recognition at the fovea is expensive and used sparingly.
 
-```
-  -> check says "unexpected"
-  -> read near action point (get text of what appeared)
-  -> if text is enough to understand: proceed
-  -> if need visual detail (icon, color, layout): look at the region
-```
-
-This mirrors the biological Orient-Read-Confirm cycle:
-- `glance` = Orient phase (gist extraction: scene category in 36ms, dorsal "where" stream)
-- `read` = Comprehend phase (foveal text reading: serial word recognition at fixation)
-- `check` = Confirm phase (predictive coding: did reality match my expectation?)
-- `look` = Inspect phase (foveal fixation on non-text elements: ventral "what" stream, used only when needed)
+Mapping back to the biology:
+- `scan` = rods + magnocellular + dorsal ("where"): wide-field grayscale + motion/change detection
+- `focus` = cones + parvocellular + ventral ("what"): local color + high acuity
+- `read` = VWFA: symbolic extraction from the ventral stream
 
 ---
 
@@ -217,21 +202,21 @@ One skill named `computer_use`, two perception backends selected by config:
 ```
 fsp/
   computer_use/
-    __init__.py       # ComputerUse(perception="standard"|"fsp") — single entry point
+    __init__.py       # ComputerUse(perception="standard"|"fsp") -- single entry point
     actions.py        # click, type_text, scroll, keyboard_shortcut (shared by both)
     capture.py        # screen capture, a11y queries, OCR (shared by both)
     memory.py         # Sliding window: keep last N steps as text, drop old images
 
     perception/
       standard.py     # Full screenshot every step. The control condition.
-      fsp.py          # observe tool: check/read/glance/look. The treatment.
+      fsp.py          # observe tool: read / scan / focus. The treatment.
       observe.py      # Mode dispatch for FSP backend
-      diff.py         # Change detection for 'check' mode (phash + SSIM + semantic)
-      glance.py       # a11y layout description (with OCR fallback). Text only.
       read.py         # Text extraction at coordinates via a11y or OCR crop
+      scan.py         # Grayscale downsample + inter-frame change detection
+      focus.py        # High-res full-color crop with optional a11y annotations
 
   eval/
-    runner.py         # Takes (model, perception, benchmark) → results
+    runner.py         # Takes (model, perception, benchmark) -> results
     screenspot.py     # ScreenSpot-Pro loader
     osworld.py        # OSWorld loader
 ```
@@ -248,50 +233,36 @@ for model in ["gpt-5.4", "opus-4.6"]:
 
 **Standard backend:** Model gets a single `computer_use` tool. Every action returns a full screenshot. Mirrors current Claude/OpenAI production behavior.
 
-**FSP backend:** Model gets `computer_use` with an `observe` sub-tool. Actions and observations are decoupled. The model decides when and how to look.
+**FSP backend:** Model gets `computer_use` with an `observe` sub-tool. Actions and observations are decoupled. The model decides which stream to sample.
 
 ### `observe.py` core
 
 ```python
-from PIL import Image
+from PIL import Image, ImageOps
 import imagehash
 
 class Observer:
-    def __init__(self):
-        self.prev_screenshot = None
+    def __init__(self, scan_width: int = 480, scan_height: int = 270):
+        self.scan_width = scan_width
+        self.scan_height = scan_height
+        self.prev_scan = None          # last grayscale scan image
         self.prev_hash = None
         self.last_action_point = None  # (x, y) of last click/interaction
 
     def observe(self, mode: str, **kwargs) -> dict:
-        """LLM chooses observation mode. Three modes return text only; one returns an image."""
-        if mode == "check":
-            return self._check(kwargs.get("expectation", ""))
-        elif mode == "glance":
-            return self._glance()
-        elif mode == "read":
+        """LLM chooses which retinal stream to sample."""
+        if mode == "read":
             return self._read(kwargs["center_x"], kwargs["center_y"],
                               kwargs.get("radius", 150))
-        elif mode == "look":
-            return self._look(kwargs["center_x"], kwargs["center_y"],
-                              kwargs.get("radius", 150))
-
-    def _glance(self) -> dict:
-        """Scene gist: text-only layout description. No image returned."""
-        img = capture_screen()
-        self._update_state(img)
-        # Try a11y for layout description; fall back to OCR
-        layout = try_accessibility_layout() or ocr_layout_description(img)
-        return {
-            "type": "glance",
-            "text": layout,  # "Chrome - Gmail Inbox. Sidebar left, email list center, reading pane right."
-            "tokens": ~30-50
-        }
+        elif mode == "scan":
+            return self._scan()
+        elif mode == "focus":
+            return self._focus(kwargs["center_x"], kwargs["center_y"],
+                               kwargs.get("radius", 150))
 
     def _read(self, cx: int, cy: int, radius: int) -> dict:
-        """Foveal text reading: extract text at a point. Text only, no image."""
+        """VWFA: text extraction at a point. No pixels returned."""
         img = capture_screen()
-        self._update_state(img)
-        # Try a11y text content at coordinates; fall back to OCR on crop
         text = try_accessibility_text_at(cx, cy, radius)
         if text is None:
             crop = img.crop((
@@ -302,61 +273,50 @@ class Observer:
         return {
             "type": "read",
             "text": text,
-            "tokens": len(text.split()) // 2  # rough estimate
+            "tokens": max(1, len(text.split()) // 2),
         }
 
-    def _look(self, cx: int, cy: int, radius: int) -> dict:
-        """Foveal fixation: high-res crop at a point. The only mode that returns an image."""
+    def _scan(self) -> dict:
+        """Rods + magnocellular: grayscale wide-field + change detection."""
         img = capture_screen()
-        self._update_state(img)
+        gray = ImageOps.grayscale(img).resize(
+            (self.scan_width, self.scan_height), Image.LANCZOS
+        )
+        curr_hash = imagehash.phash(img)
+
+        changes_text = ""
+        if self.prev_scan is not None and self.prev_hash is not None:
+            distance = curr_hash - self.prev_hash
+            if distance < 3:
+                changes_text = "No visible changes since last scan."
+            else:
+                regions = diff_regions(self.prev_scan, gray,
+                                       anchor=self.last_action_point)
+                changes_text = describe_regions(regions)
+
+        self.prev_scan = gray
+        self.prev_hash = curr_hash
+        return {
+            "type": "scan",
+            "image": gray,                # 1-channel, ~480x270
+            "changes": changes_text,      # "Dialog appeared near (1200, 400)."
+            "tokens": (gray.width * gray.height) // 1800 + len(changes_text) // 4,
+        }
+
+    def _focus(self, cx: int, cy: int, radius: int) -> dict:
+        """Cones + parvocellular: high-res full-color crop at a point."""
+        img = capture_screen()
         crop = img.crop((
             max(0, cx - radius), max(0, cy - radius),
             min(img.width, cx + radius), min(img.height, cy + radius)
         ))
         annotations = try_accessibility_in_region(cx, cy, radius)
         return {
-            "type": "look",
-            "image": crop,
+            "type": "focus",
+            "image": crop,                # full-color, high-res
             "annotations": annotations,
-            "tokens": (crop.width * crop.height) // 750
+            "tokens": (crop.width * crop.height) // 750,
         }
-
-    def _check(self, expectation: str) -> dict:
-        """Predictive coding: expectation vs reality, anchored to action point. Text only."""
-        img = capture_screen()
-        curr_hash = str(imagehash.phash(img))
-
-        if self.prev_hash is None:
-            self._update_state(img)
-            return {"type": "check", "text": "First observation.", "tokens": 5}
-
-        distance = imagehash.hex_to_hash(curr_hash) - imagehash.hex_to_hash(self.prev_hash)
-        self._update_state(img)
-
-        if distance < 3:
-            return {
-                "type": "check",
-                "text": f"Screen unchanged. Expected: {expectation}. "
-                        "Action may have failed.",
-                "tokens": ~15
-            }
-
-        # Describe what changed semantically, focused near action point
-        changes = describe_changes_near(
-            self.prev_screenshot, img, self.last_action_point
-        )
-        met = does_change_match_expectation(changes, expectation)
-        return {
-            "type": "check",
-            "text": f"Expected: {expectation}. "
-                    f"{'Confirmed.' if met else 'NOT as expected.'} "
-                    f"Changes: {changes}",
-            "tokens": ~20-50
-        }
-
-    def _update_state(self, img):
-        self.prev_screenshot = img
-        self.prev_hash = str(imagehash.phash(img))
 ```
 
 ### Memory: vision for the present, text for the past
@@ -365,7 +325,7 @@ Following Fara-7B's finding that text history outperforms screenshot history, an
 
 ```python
 class SimpleMemory:
-    def __init__(self, window=5):
+    def __init__(self, window: int = 5):
         self.steps = []
         self.window = window
 
@@ -383,30 +343,30 @@ class SimpleMemory:
 ### System prompt
 
 ```
-You are a desktop automation agent with efficient perception.
+You are a desktop automation agent with bio-efficient perception.
 
-You control how you observe the screen via the `observe` tool.
-Three modes return text only; one returns an image. Pick the cheapest
-mode that gives you what you need:
-
-ORIENT: When you arrive at a new screen, use mode="glance".
-  Text description of app type, layout, and state (~30 tokens).
+Your eyes have three streams, each optimized for a different question:
 
 READ: When you need to know what text says, use mode="read" with
-  coordinates. Returns extracted text content (~20-100 tokens).
-  This is the most common mode -- most screen interaction is reading.
+  coordinates. Returns extracted text content (~40 tokens). This is
+  the cheapest mode and the most common -- most screen interaction
+  is text comprehension.
 
-VERIFY: After each action, use mode="check" with your expectation.
-  Text confirmation of whether reality matched (~20 tokens).
+SCAN: When you arrive at a new screen, or to verify an action,
+  use mode="scan". Returns a low-res grayscale view of the whole
+  screen, plus a list of regions that changed since your last scan
+  (~200 tokens). Use this to orient and to detect motion.
 
-INSPECT: Only when you need visual detail that text can't capture
-  (icons, colors, charts, spatial layout), use mode="look" with
-  coordinates. This is the only mode that returns an image (~100 tokens).
+FOCUS: Only when you need color or fine visual detail that grayscale
+  cannot capture (icons, colors, charts, precise layout), use
+  mode="focus" with coordinates. Returns a full-color high-res crop
+  (~150 tokens).
 
-Prefer text modes (check, read, glance) over look.
-Prefer "check" after actions -- it's the cheapest verification.
-If "check" says the screen is unchanged, your action likely failed --
-try a different approach rather than repeating.
+Pick the cheapest mode that answers your question. Prefer "read"
+over "scan", and "scan" over "focus". After an action, a single
+"scan" both tells you what changed and lets you verify the outcome.
+If "scan" says nothing changed, your action likely failed -- try
+a different approach rather than repeating.
 ```
 
 ---
@@ -415,15 +375,22 @@ try a different approach rather than repeating.
 
 | Step pattern | Naive (screenshot/step) | FSP (LLM chooses) |
 |---|---|---|
-| Arrive at new screen, orient | 1,300 | ~40 (glance, text only) |
-| Read a label/menu/error message | 1,300 | ~40 (read, text only) |
-| Verify action succeeded | 1,300 | ~20 (check, text only) |
-| Inspect a visual element (icon, chart) | 1,300 | ~100 (look, image crop) |
-| **Typical 50-step task** | **~65,000** | **~2,000-3,500** |
+| Arrive at new screen, orient | 1,300 | ~200 (scan, grayscale) |
+| Read a label, menu, or error message | 1,300 | ~40 (read, text only) |
+| Verify action succeeded | 1,300 | ~200 (scan with change annotations) |
+| Inspect a visual element (icon, chart) | 1,300 | ~150 (focus, color crop) |
+| **Typical 50-step task** | **~65,000** | **~5,000-6,500** |
 
-Estimated **19-33x token reduction.** The improvement over the original FSP design (~3-5K) comes from replacing most `look` calls with text-only `read` calls and dropping the `scan` fallback entirely. Compatible with existing context compression (Fara-7B's "keep last 3", JetBrains observation masking) for further gains.
+Estimated **10-13x token reduction** against the naive screenshot-per-step baseline. The breakdown of a typical 50-step task under FSP:
 
-**Token profile of a typical task:** Most steps use `check` (~15 tokens) or `read` (~40 tokens). Occasional `glance` on screen transitions (~40 tokens). Rare `look` when visual detail is needed (~100 tokens). Three of four modes are text-only.
+- ~20-25 `read` calls at ~40 tok each (labels, menus, messages): ~1,000 tok
+- ~12-15 `scan` calls at ~200 tok each (orient + post-action verify): ~2,500-3,000 tok
+- ~8-10 `focus` calls at ~150 tok each (icons, charts, fine visual): ~1,200-1,500 tok
+- **Total: ~4,700-5,500 tok.**
+
+Conservative, because it assumes the agent `scan`s frequently. An agent that verifies most actions by `read`ing the expected new text (rather than a full `scan`) can push the total below 3,000 tokens, reaching ~20x reduction. Compatible with existing context compression (Fara-7B's "keep last 3", JetBrains observation masking) for further gains.
+
+**Why the math changed from the earlier 19-33x estimate.** The previous design claimed 19-33x by assuming ~90% of steps would be handled by text-only modes (`read`, `check`, `glance`). The new design is more honest about the physical cost of action verification: you usually need *some* visual evidence that the screen changed, and returning a cheap grayscale image is both more reliable than a text summary and more biologically faithful. We trade ~2x in peak token efficiency for a simpler, more robust three-mode interface that matches the retina's actual architecture.
 
 ---
 
@@ -433,7 +400,7 @@ Estimated **19-33x token reduction.** The improvement over the original FSP desi
 
 The claim is that FSP improves perception efficiency **regardless of the underlying model**. To make this conclusive, we test two models x two perception approaches:
 
-| | Standard CU (full screenshot every step) | FSP (`observe` tool) |
+| | Standard CU (full screenshot every step) | FSP (`observe` tool, 3 modes) |
 |---|---|---|
 | **GPT-5.4** (OpenAI) | Baseline A | Treatment A |
 | **Opus 4.6** (Anthropic) | Baseline B | Treatment B |
@@ -445,13 +412,13 @@ The claim is that FSP improves perception efficiency **regardless of the underly
 **Phase 1: ScreenSpot-Pro (grounding accuracy, fast iteration)**
 - Static dataset, no VM needed. Quick turnaround.
 - Measures: can the agent click the right element?
-- Key difficulty: targets occupy only 0.07% of image area -- where zoom/crop approaches shine.
+- Key difficulty: targets occupy only 0.07% of image area -- where `focus` and the zoom/crop approaches shine.
 - Run all 4 conditions (2 models x 2 approaches).
 
 **Phase 2: OSWorld (end-to-end task completion)**
 - Full desktop tasks in VMs. Slower, more expensive.
 - Measures: does the agent complete real tasks?
-- The benchmark most cited in the CLAUDE.md research review (latency degradation, observation waste, grounding failures).
+- The benchmark most cited in observational-efficiency analyses (latency degradation, observation waste, grounding failures).
 - Run all 4 conditions.
 
 ### Metrics per condition
@@ -459,10 +426,10 @@ The claim is that FSP improves perception efficiency **regardless of the underly
 | Metric | What it tells us |
 |--------|-----------------|
 | Success rate | FSP must not hurt task completion |
-| Total input tokens per task | The core claim: 19-33x reduction |
+| Total input tokens per task | The core claim: 10-13x reduction |
 | Observation tokens only | Isolates perception savings from reasoning tokens |
-| Steps to completion | Fewer wasted observation cycles (OSWorld-Human found agents use 1.4-2.7x more than necessary) |
-| Mode distribution (FSP only) | What does the agent actually choose? How often does it fall back to `look`? |
+| Steps to completion | Fewer wasted observation cycles (OSWorld-Human found 1.4-2.7x waste) |
+| Mode distribution (FSP only) | Does the agent actually use `read` most? How often does it reach for `focus`? |
 | Latency per step | Less context = faster inference |
 | Grounding accuracy (ScreenSpot-Pro) | Click precision on small elements |
 
@@ -471,7 +438,7 @@ The claim is that FSP improves perception efficiency **regardless of the underly
 Both conditions use the same `computer_use` skill. The only variable is the perception backend:
 
 - **`perception="standard"`:** Full screenshot returned after every action. Model sees one `computer_use` tool. Mirrors current Claude/OpenAI production behavior.
-- **`perception="fsp"`:** Screenshot captured internally but NOT sent directly. Model sees `computer_use` with `observe` sub-tool (4 modes). Actions and observations are decoupled — the model decides when and how to look.
+- **`perception="fsp"`:** Screenshot captured internally but NOT sent directly. Model sees `computer_use` with `observe` sub-tool (3 modes: `read`, `scan`, `focus`). Actions and observations are decoupled -- the model decides which stream to sample.
 
 Same skill name, same action space, same system prompt (minus perception-specific instructions). The model doesn't know which condition it's in.
 
@@ -481,20 +448,20 @@ Same skill name, same action space, same system prompt (minus perception-specifi
 
 | Feature | Research basis | V2 priority |
 |---------|---------------|-------------|
+| Bottom-up saliency monitor ("attention interrupt") | Itti & Koch saliency; 40% change blindness without attention; fills the top-down-only gap | High -- environmental changes should be able to capture the agent's attention without being asked |
 | `find` mode (guided search by target description) | Wolfe's Guided Search; ScreenSeeker's cascaded search (+254%) | High -- replaces blind `elements` dump |
-| RL-trained mode selection | GUI-Eyes: 0.6*R_acc + 0.3*R_tool reward; LASER: Monte Carlo preference optimization | High -- agent learns when to zoom vs skip |
+| RL-trained mode selection | GUI-Eyes: 0.6*R_acc + 0.3*R_tool reward; LASER: Monte Carlo preference optimization | High -- agent learns when to scan vs read vs focus |
 | Grouped-action execution | OSWorld-Human: agents waste 1.4-2.7x observation cycles | Medium -- multiple actions from one observation |
 | Task-conditioned visual encoding | Qwen2.5-VL cross-attention; InternVL prompt-modulated vision | Medium -- encode screenshot differently per task |
 | Hierarchical memory consolidation | AgentOCR: RL-selected compression; ACON: NL-optimized guidelines | Medium -- adaptive compression of old steps |
 | OmniParser fallback for broken a11y | Screen2AX: only 33% of macOS apps have full a11y; OmniParser v2: 0.6s/frame | Medium -- vision-generated element lists |
-| Predictive screen state model | PC-Transformers (ICLR 2024); bio predictive coding | Low -- richer `check` with hierarchical prediction |
 
 ---
 
 ## The core bet
 
-Every production computer-use system today sends a full screenshot at every step. The research unanimously shows this is wasteful: Fara-7B proves text history >> screenshot history, JetBrains proves old observations can be masked with zero cost, OSWorld-Human proves agents take 1.4-2.7x more observation cycles than necessary, and the entire zoom/crop literature proves targeted inspection outperforms full-screen processing.
+Every production computer-use system today sends one full-color full-resolution screenshot at every step. The primate retina, solving a structurally identical bandwidth problem, does not. It sends a cheap grayscale wide-field stream (rods / magnocellular), an expensive color foveal stream (cones / parvocellular), and a symbolic text channel (VWFA) -- and it lets higher cortex decide which to attend to.
 
-The bet is: **an LLM that can choose how to look will look more efficiently than one forced to see everything -- and most of the time, it doesn't need to "look" at all, just read.** The biological evidence (ambient-to-focal transition at 700ms, 40% change blindness for off-focus events, 36ms gist extraction, predictive coding suppression of expected input) explains why this should work. The agent systems evidence (GUI-Eyes, RegionFocus, ZoomClick, AdaZoom-GUI) proves it works in practice for grounding. What's missing is a unified tool that packages all observation modes into a single, simple interface the LLM can drive -- with text as the default output and pixels as the exception.
+The bet is: **an LLM that picks among these three streams will perceive more efficiently than one forced to see everything at once, because the retina's compression strategy is the one that actually works on a finite bandwidth budget.** The research agrees from multiple angles: Fara-7B proves text history >> screenshot history, JetBrains proves old observations can be masked at zero cost, OSWorld-Human proves agents take 1.4-2.7x more observation cycles than necessary, and the entire zoom/crop literature proves targeted inspection outperforms full-screen processing. What was missing was a unified interface that packaged the right set of observation modes -- one per retinal stream -- into a simple tool the LLM can drive.
 
-That's what `observe` with `check/read/glance/look` is. Three text-only modes, one image mode.
+That is `observe` with `read`, `scan`, and `focus`. One text mode, one grayscale wide-field mode, one color foveal mode. Three streams, one decision per step, the same decomposition primate vision has been using for half a billion years.
